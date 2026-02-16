@@ -1,0 +1,15 @@
+# .codex/config.toml
+# Project-scoped Codex configuration.
+# NOTE: Project config loads only when this project is trusted.
+
+# If a directory lacks AGENTS.md / AGENTS.override.md,
+# Codex can try these filenames as fallbacks.
+project_doc_fallback_filenames = [
+  "CODEX.md",
+  "INSTRUCTIONS.md",
+  "CODE_REVIEW.md",
+  "CONTRIBUTING.md"
+]
+
+# Optional (leave commented unless you hit truncation):
+# project_doc_max_bytes = 65536
