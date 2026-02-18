@@ -812,6 +812,50 @@ body {
   margin-top: var(--space-2);
 }
 
+.soft-countdown-banner {
+  position: fixed;
+  top: var(--space-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 56;
+  width: min(980px, calc(100vw - (var(--space-4) * 2)));
+  border: 1px solid rgba(181, 65, 0, 0.36);
+  border-radius: var(--radius-3);
+  background: color-mix(in oklab, var(--card-strong) 88%, #ffd7c5);
+  box-shadow: 0 12px 28px rgba(94, 33, 3, 0.18);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.soft-countdown-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.soft-countdown-title {
+  margin: 0;
+  color: #8d2f00;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.soft-countdown-message {
+  margin: 0;
+  color: #7a2900;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.soft-countdown-actions {
+  flex-wrap: wrap;
+}
+
 .overlay {
   position: fixed;
   inset: 0;
@@ -933,6 +977,10 @@ body {
     --container-max: 980px;
   }
 
+  .soft-countdown-banner {
+    width: min(860px, calc(100vw - (var(--space-4) * 2)));
+  }
+
   .top-status-bar {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -943,6 +991,24 @@ body {
 }
 
 @media (max-width: 1080px) {
+  .soft-countdown-banner {
+    top: var(--space-2);
+    width: calc(100vw - (var(--space-2) * 2));
+    padding: var(--space-3);
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .soft-countdown-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .soft-countdown-actions > .ui-button {
+    flex: 1;
+    min-width: 0;
+  }
+
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
   }

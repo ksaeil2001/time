@@ -1,42 +1,78 @@
-# Auto Shutdown Scheduler — Codex Project Instructions (AGENTS.md)
+# PROJECT KNOWLEDGE BASE
 
-## Project context
-- This repo is a safety‑critical desktop app (Tauri + React/TS + Rust) that can trigger OS shutdown.
-- Treat any change that could cause an unexpected shutdown, block cancel paths, or reduce warning visibility as HIGH RISK.
+Generated: 2026-02-17 (Asia/Seoul)
+Commit: db40591
+Branch: main
 
-## Source of truth (must follow)
-When judging correctness or UX, follow these documents (in this order):
-1) PRD_MVP_v1.0.md (product requirements, safety rules)
-2) DESIGN_GUIDE_MVP_v1.0.md (layout/UX/accessibility, safety UX rules)
-3) USE_CASE_MVP_v1.0.md (flows, edge cases, failure handling)
-4) IA_MVP_v1.0.md (routes, navigation, information architecture)
+## OVERVIEW
+- Safety-critical desktop scheduler (Tauri + React/TypeScript + Rust) that can issue OS shutdown commands.
+- Highest risk area: any change that can reduce cancellation visibility, arm silently, or execute shutdown unexpectedly.
 
-If file paths differ, locate by filename.
+## STRUCTURE
+time/
+|- src/                  # Frontend app state, screens, safety actions, UI primitives
+|  |- components/ui/     # Design-system primitives used across screens
+|- src-tauri/src/        # Rust scheduler/state machine/process scan/shutdown dispatch
+|- docs/                 # Canonical requirements + runbook + archive/deprecated governance
+|- scripts/              # Verification and handoff-manifest automation
+|- e2e/                  # Playwright end-to-end safety/accessibility flow
 
-## Non‑negotiables (do not break)
-- Explicit confirmation before entering ARMED (never arm silently).
-- Cancel/Snooze must remain easy to access (UI + overlay + tray/menu bar paths).
-- Always disclose both: exact shutdown time AND remaining time.
-- Final grace period (60s) must remain actionable (cancel/snooze still possible).
-- Single active schedule policy must remain consistent across entry points.
+## WHERE TO LOOK
+| Task | Location | Notes |
+|------|----------|-------|
+| Safety policy truth | docs/PRD_MVP_v1.0.md | Product non-negotiables and acceptance criteria |
+| UX/accessibility safety | docs/DESIGN_GUIDE_MVP_v1.0.md | 3-second scan, 30-second rule, overlay constraints |
+| Flow/state transitions | docs/USE_CASE_MVP_v1.0.md | Idle/Armed/FinalWarning semantics and edge cases |
+| Route/information structure | docs/IA_MVP_v1.0.md | Navigation and screen-level IA |
+| Frontend behavior | src/App.tsx | Main orchestration, overlays, quick actions, route rendering |
+| Frontend contracts | src/types.ts, src/api.ts | Front-back schema and invoke wrapper |
+| Backend scheduler logic | src-tauri/src/lib.rs | Core state machine, persistence, tray commands, shutdown execution |
+| Backend process scan | src-tauri/src/process_scan.rs | Process matching and fail-safe scan rules |
+| Verification pipeline | scripts/verify/run-verify.mjs | Ordered lint/typecheck/test/build/e2e logic |
 
-## Default behavior for Codex in this repo
-- Prefer minimal, targeted diffs. Do not refactor broadly unless asked.
-- Do not change user‑visible behavior or safety policy unless the user explicitly requests it.
-- If you must propose behavior changes (e.g., fixing a safety bug), propose as a PATCH PLAN first.
+## CODE MAP
+- LSP codemap unavailable in this environment (missing typescript-language-server and rust-analyzer).
+- Hotspot files from static analysis:
+  - src/App.tsx (single-file frontend orchestrator)
+  - src-tauri/src/lib.rs (single-file backend state machine)
+  - scripts/verify/run-verify.mjs (verification policy automation)
 
-## Repo-wide code review default
-- If the user asks for “전체 코드 리뷰 / full repo review / audit”, use the skill: `$full-repo-review`.
-- Otherwise, for small reviews: provide
-  - (1) findings grouped by severity (P0/P1/P2),
-  - (2) evidence (file path + function/component),
-  - (3) concrete recommendations,
-  - (4) QA checklist.
+## CONVENTIONS
+- Source-of-truth order is fixed: PRD -> DESIGN_GUIDE -> USE_CASE -> IA.
+- Keep diffs minimal and targeted; avoid broad refactor unless explicitly requested.
+- Use as-built documentation: no speculative/planned statements in canonical docs.
+- Verification-first workflow after code changes: typecheck/test/build + Rust tests as applicable.
+- Canonical frontend scripts live in package.json; backend crate config in src-tauri/Cargo.toml.
 
-## Running commands
-- Prefer read-only inspection. Avoid commands that mutate the repo unless necessary.
-- If you modify code: run appropriate format/lint/typecheck/tests that exist in this repo (inspect package.json and Cargo configs first).
+## ANTI-PATTERNS (THIS PROJECT)
+- Arm confirmation bypass (explicit confirmation before ARMED is mandatory).
+- Hidden/removed cancel-snooze paths in any of: main UI, final-warning overlay, tray.
+- Showing only relative or only absolute shutdown time (must show both).
+- In Final Grace, disabling cancel/snooze before countdown expiry.
+- Multi-schedule behavior violating single-active-schedule policy.
+- Introducing new docs for policy/process when RUNBOOK consolidation says merge into existing docs.
 
-## Output quality bar
-- No hand-wavy statements. Always include code evidence.
-- Prioritize user safety and reliability over cleverness.
+## UNIQUE STYLES
+- Safety language and UX copy are Korean-first and policy-specific.
+- Test coverage intentionally mixes unit/policy/a11y/behavior + optional e2e.
+- Simulation mode and dry-run traces are first-class safety artifacts, not secondary debug behavior.
+- docs/deprecated is stub-only; docs/archive is snapshot-only; current truth lives in canonical docs + RUNBOOK.
+
+## COMMANDS
+```bash
+npm run dev
+npm run tauri dev
+npm run lint
+npm run typecheck
+npm run test
+npm run test:a11y
+npm run test:e2e
+npm run build
+npm run verify
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+## NOTES
+- Treat shutdown-command dispatch, final-warning timing, and cancel/snooze controls as high-risk code paths.
+- If behavior/policy changes are requested, document intent and verify against canonical docs before editing.
+- For full-repo audit requests, use $full-repo-review workflow.

@@ -80,6 +80,28 @@ function computeSpecificTimeTrigger(targetLocalTime: string | undefined, nowMs: 
   return candidate.getTime();
 }
 
+function computeShutdownAtMs(active: ActiveSchedule): number | undefined {
+  if (active.status === "finalWarning") {
+    if (active.finalWarningStartedAtMs === undefined) {
+      return undefined;
+    }
+    return active.finalWarningStartedAtMs + active.finalWarningDurationSec * 1000;
+  }
+
+  if (active.mode === "processExit" || active.triggerAtMs === undefined) {
+    return undefined;
+  }
+
+  return active.triggerAtMs + active.finalWarningDurationSec * 1000;
+}
+
+function withComputedShutdownAt(active: ActiveSchedule): ActiveSchedule {
+  return {
+    ...active,
+    shutdownAtMs: computeShutdownAtMs(active),
+  };
+}
+
 function pushHistory(eventType: string, result: string, reason: string, scheduleId?: string): void {
   state.history.push({
     scheduleId,
@@ -106,11 +128,11 @@ function evaluateTransitions(): void {
     active.triggerAtMs !== undefined &&
     active.triggerAtMs <= state.nowMs
   ) {
-    state.active = {
+    state.active = withComputedShutdownAt({
       ...active,
       status: "finalWarning",
       finalWarningStartedAtMs: state.nowMs,
-    };
+    });
     pushHistory("final_warning", "ok", "MOCK: FINAL_WARNING_ENTERED", active.id);
     return;
   }
@@ -121,7 +143,12 @@ function evaluateTransitions(): void {
     state.nowMs >= active.finalWarningStartedAtMs + active.finalWarningDurationSec * 1000
   ) {
     pushHistory("shutdown_initiated", "ok", "MOCK: SHUTDOWN_INITIATED", active.id);
-    pushHistory("executed", "ok", "MOCK: EXECUTED", active.id);
+    pushHistory(
+      "executed",
+      "ok",
+      "DRY_RUN_SHUTDOWN_COMMAND: shutdown /s /t 30 (abort: shutdown /a)",
+      active.id,
+    );
     state.active = undefined;
   }
 }
@@ -129,6 +156,9 @@ function evaluateTransitions(): void {
 function buildSnapshot(): SchedulerSnapshot {
   state.nowMs = Date.now();
   evaluateTransitions();
+  if (state.active) {
+    state.active = withComputedShutdownAt(state.active);
+  }
   return {
     active: state.active ? { ...state.active } : undefined,
     settings: { ...state.settings },
@@ -182,6 +212,7 @@ async function armSchedule(request: ScheduleRequest): Promise<SchedulerSnapshot>
     status: "armed",
     finalWarningDurationSec: state.settings.finalWarningSec,
   };
+  state.active = withComputedShutdownAt(state.active);
 
   pushHistory("armed", "ok", "MOCK: ARMED", scheduleId);
   return buildSnapshot();
@@ -204,19 +235,19 @@ async function postponeSchedule(minutes: number, reason = "MOCK: USER_POSTPONED"
 
   const safeMinutes = Math.min(1440, Math.max(1, Math.round(minutes)));
   if (state.active.mode === "processExit") {
-    state.active = {
+    state.active = withComputedShutdownAt({
       ...state.active,
       status: "armed",
       finalWarningStartedAtMs: undefined,
       snoozeUntilMs: state.nowMs + safeMinutes * 60 * 1000,
-    };
+    });
   } else {
-    state.active = {
+    state.active = withComputedShutdownAt({
       ...state.active,
       status: "armed",
       finalWarningStartedAtMs: undefined,
       triggerAtMs: state.nowMs + safeMinutes * 60 * 1000,
-    };
+    });
   }
 
   pushHistory("postponed", "ok", reason, state.active.id);
@@ -232,10 +263,10 @@ async function updateSettings(updates: SettingsUpdate): Promise<SchedulerSnapsho
   };
 
   if (state.active) {
-    state.active = {
+    state.active = withComputedShutdownAt({
       ...state.active,
       finalWarningDurationSec: state.settings.finalWarningSec,
-    };
+    });
   }
 
   pushHistory("settings_updated", "ok", "MOCK: SETTINGS_UPDATED");

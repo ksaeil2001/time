@@ -5,12 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "lint": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit",
     "build": "tsc && vite build",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri",
     "test:a11y": "vitest run src/a11y.test.tsx",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "verify:preflight": "node scripts/verify/preflight.mjs",
+    "verify:manifest": "node scripts/handoff/generate-manifest.mjs",
+    "verify": "node scripts/verify/run-verify.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

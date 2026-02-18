@@ -1,193 +1,192 @@
-﻿## 자동 종료 스케줄러 IA (MVP v1.0)
+# 자동 종료 예약 스케줄러 IA (MVP v1.0)
 
-> Last synced with implementation: 2026-02-16 (commit N/A - git metadata unavailable)
+> STATUS: CANONICAL
+> Role: 라우트/화면 구조/내비게이션의 진실 원천
+> Canonical Set: [PRD](./PRD_MVP_v1.0.md), [DESIGN_GUIDE](./DESIGN_GUIDE_MVP_v1.0.md), [USE_CASE](./USE_CASE_MVP_v1.0.md), [IA](./IA_MVP_v1.0.md)
+> Ops Guide: [RUNBOOK.md](./RUNBOOK.md)
+> Archive: [archive/](./archive/)
+> Artifacts: [../artifacts/verification/](../artifacts/verification/)
+> Update Rule: Follow RUNBOOK `Doc Sync`
+> Last synced with implementation: 2026-02-17 (commit db40591)
 
-## As-built Alignment
-- last_synced: 2026-02-16 (commit N/A - git metadata unavailable)
-- key changes (변경 이유/영향):
-  - 라우팅은 hash 기반이며 `/schedule/new`에서 `mode=countdown|specific-time|process-exit` 쿼리를 사용한다.
-    영향: 라우트 문서는 해시 URL과 kebab-case 모드 토큰을 기준으로 표준화한다.
-  - Sidebar/Route 라벨은 `src/constants/copy.ts` 맵과 동일하게 `대시보드`, `새 예약`, `활성 예약`, `이력`, `일반 설정`, `알림 설정`, `Google 연동`, `도움말`을 사용한다.
-    영향: IA 내 라벨 표기를 코드 문자열과 1:1로 고정한다.
-  - TopStatusBar와 QuickActionFooter는 온보딩을 제외한 모든 라우트에서 고정 노출되며, 활성 예약 중에는 라우트 이동과 무관하게 취소/미루기 경로가 유지된다.
-    영향: `/history`, `/settings/*`, `/help`에서도 안전 액션이 숨겨지지 않는다.
-  - QuickActionFooter는 Idle에서 `새 예약 만들기` + 비활성 `취소/10분 미루기` + 비활성 `미루기(분)` 입력을 표시한다.
-    영향: Idle `미루기(분)` 입력은 숨김이 아니라 비활성 노출로 정의해야 한다.
-  - 트레이/메뉴바는 `Quick Start Last Mode`, `Show Countdown`, `Open Window`, `Cancel Schedule`, `Snooze 10m`, `Quit App` 순서의 고정 메뉴를 제공한다.
-    영향: Idle에서도 `Cancel/Snooze` 메뉴는 비활성화되지 않고 no-op/요청 무시로 처리된다.
-  - ProcessExit 프로세스 목록은 새로고침 중심으로 동작하며 UI 상한은 120개, 정렬은 name→pid, 검색 입력은 미제공이다.
-    영향: IA의 Watch Process 탐색 흐름은 "검색"이 아닌 "정렬+새로고침" 패턴을 따른다.
-  - shell 계열 프로세스는 `실행 파일 경로` 또는 `명령줄 토큰` 없이 Arm할 수 없고, UI/백엔드에서 모두 차단된다.
-    영향: 오탐 방지 제약이 입력 단계에서 강제된다.
-  - process-exit 감시 selector가 손상되면 `NO_FAIL_OPEN_PROCESS_EXIT` 정책으로 활성 예약을 즉시 안전 중단한다.
-    영향: fail-open 없이 예약이 취소되며 재선택 안내 배너가 노출된다.
-- P0 Policy(목표):
-  - `Armed` 상태 Quit 요청은 `BLOCK_AND_CHOOSE`로 처리한다.
-  - Final Grace는 기본 60초, 설정 범위 `15~300초`를 사용한다.
-  - 사전 알림 10m/5m/1m은 시간 기반 모드 전용이며 `process-exit`는 완료 감지 후 즉시 Final Warning으로 진입한다.
-  - `cmdlineContains` 원문은 저장/로그에 남기지 않고 마스킹/해시 값만 허용한다.
-- As-built note(현재 구현):
-  - Tray/App Quit은 `armed`/`finalWarning`에서 `quit_guard_requested` 모달을 통해 `예약 취소 후 종료` / `백그라운드 유지` / `돌아가기`를 요구한다(정책과 일치).
-  - `process-exit` 사전 알림 정책(사전 알림 없음 + Final Warning 직행)은 구현과 일치한다.
-  - 상태 파일에는 `active.processSelector` 및 `lastScheduleRequest.processSelector`의 `executable`, `cmdlineContains` 원문이 저장될 수 있다(정책과 불일치).
+## TL;DR
+- 이 문서는 라우트, 화면 구조, 내비게이션의 정본이다.
+- MVP 정본 라우트는 `/dashboard`, `/schedule/new`, `/schedule/active`, `/history`, `/settings/*`, `/help`이다.
+- TopStatusBar/QuickActionFooter는 안전 액션 가시성(취소/미루기) 관점에서 상시 유지한다.
+- 트레이/종료 경로에서도 단일 활성 예약 정책과 Quit Guard를 동일하게 적용한다.
+- 과거 버전은 archive에 보관하고, 운영 증빙은 RUNBOOK + artifacts 경로로 분리한다.
 
-## Summary
-- 단일 창 데스크톱 앱(Tauri + React) 기준
-- SPA 스타일 in-app route 기준 정보 구조 채택
-- 단일 활성 예약 정책
-- 창 닫기(X) 시 종료가 아닌 트레이/메뉴바 최소화
-- `Armed` 상태 Quit은 즉시 종료가 아니라 선택 모달(`예약 취소 후 종료` / `백그라운드 유지`)을 거침
-- 최종 경고 기본값은 60초이며 설정에서 15~300초로 변경 가능
-- 프로세스 종료 판정은 `PID/트리 -> 추적 PID -> 고급 매칭(executable/cmdlineContains) -> name fallback` 순서
-- process-exit는 10m/5m/1m 사전 알림 없이 완료 감지 후 final warning으로 즉시 진입
-- process-exit Snooze는 감시를 유지하고 final warning 진입만 지연(`snoozeUntilMs`)
-- Notification은 info-only이며 액션 실행은 앱/오버레이/트레이 경로로 제한
-- History는 저장 250(FIFO), UI 렌더 120(페이지 단위)로 분리
-- ProcessExit 화면에서 센티널 템플릿(Windows PowerShell/macOS shell)과 실행 가이드를 제공(앱 직접 spawn 미지원)
-- Google 연동은 옵션이며 현재 구현은 모의 연결 상태 토글만 제공
-- 모드 명명 규칙: URL 쿼리는 kebab-case(`specific-time`, `process-exit`), 내부 타입은 camelCase(`specificTime`, `processExit`)
+## Document Meta
+- Version: MVP v1.0 (as-built canonical)
+- Date: 2026-02-17
+- Change Summary: 문서 정본 체계 정리(archive 링크/상호참조 정비)
 
-## State Model Layers (IMP-05)
-| 계층 | 상태 |
-| --- | --- |
-| UI 표기 상태 | `대기 중(예약 없음)`, `예약됨(Armed)`, `최종 경고(Final warning)`, `종료 명령 실행 중(Shutting down)` |
-| 저장 상태 | `active=null`, `active.status=armed|finalWarning`, `history.status=completed|failed|cancelled` |
-| 내부 실행 상태 | `idle -> armed -> finalWarning -> shuttingDown` |
+## Archived Versions
+- [2026-02-17 pre-refactor snapshot](./archive/2026-02-17_pre-refactor/IA_MVP_v1.0.md)
 
-```text
-IDLE -> ARMED -> FINAL_WARNING -> SHUTTING_DOWN -> HISTORY(completed|failed)
-```
+## 1) IA 원칙
+- 30초 룰: 사용자는 어떤 화면에서도 30초 안에 `상태`, `다음 행동`, `안전 경로`를 이해해야 한다.
+- 3초 스캔: 헤더에서 `상태 배지`, `남은 시간`, `종료 시각`을 3초 내 인지해야 한다.
+- 사용자 라벨은 `예약`을 사용하고, 내부 경로는 `/schedule/*`을 유지한다.
+- 단일 활성 예약 정책은 UI/트레이/quit guard 모두 동일하게 적용한다.
 
-Glossary:
-- `armed`: 사용자 확인 후 활성화된 예약 상태
-- `finalWarning`: 종료 직전 개입 가능한 경고 상태
-- `shuttingDown`: 내부 실행 단계(비영속)
-- `watching_process`: process-exit 모드의 UI 파생 태그
+## 2) 라우트 맵 (정본)
+| 내부 라우트 | 사용자 라벨 | URL 예시 |
+| --- | --- | --- |
+| `/dashboard` | 대시보드 | `/#/dashboard` |
+| `/schedule/new` | 새 예약 | `/#/schedule/new?mode=countdown|specific-time|process-exit` |
+| `/schedule/active` | 활성 예약 | `/#/schedule/active` |
+| `/history` | 이력 | `/#/history` |
+| `/settings/general` | 일반 설정 | `/#/settings/general` |
+| `/settings/notifications` | 알림 설정 | `/#/settings/notifications` |
+| `/settings/integrations/google` | Google 연동 | `/#/settings/integrations/google` |
+| `/help` | 도움말 | `/#/help` |
 
-## Site Map
-```text
-APP_ROOT
-├─ /onboarding/welcome
-├─ /onboarding/permissions
-├─ /onboarding/safety
-├─ /dashboard
-├─ /schedule/new?mode=countdown|specific-time|process-exit
-├─ /schedule/active
-├─ /history
-├─ /settings/general
-├─ /settings/notifications
-├─ /settings/integrations/google
-└─ /help
-```
+참고:
+- 온보딩 라우트(`/onboarding/*`)는 진입 전 단계로 유지하지만 MVP 핵심 IA에는 위 8개 라우트를 기준으로 문서화한다.
 
-## Navigation Structure
-- 좌측 사이드바: 주요 화면 이동
-- 상단 헤더: 라우트 제목 + 상태 제목(`대기 중(예약 없음)`/`예약됨`/`최종 경고`) + 남은 시간/종료 예정
-- 하단 퀵 액션 바: 온보딩을 제외한 전 라우트에서 노출되며 Idle은 `새 예약 만들기` 중심, 활성 예약에서 `취소 → 10분 미루기 → 5/15분 미루기 → 입력 미루기` 순으로 제공
-- 트레이/메뉴바: Quick Start Last Mode, Show Countdown, Open Window, Cancel Schedule, Snooze 10m, Quit App
-- Quit 정책(구현): Armed/FinalWarning 상태에서 Quit 요청 시 선택 모달을 제공하고 처리 방식을 먼저 선택
-
-QuickActionFooter 상태 규칙(IMP-08):
-| 상태 | `새 예약 만들기` | `지금 취소` | `미루기 입력(1..1440)` | `미루기 빠른 버튼` |
-| --- | --- | --- | --- | --- |
-| Idle | Enabled | Disabled(사유 안내) | Disabled(기본값 10 노출) | `10분 미루기` 단일 버튼 Disabled(사유 안내) |
-| Armed | Hidden | Enabled | Enabled(기본 10) | `10·5·15분 미루기` Enabled |
-| FinalWarning | Hidden | Enabled | Enabled(기본 10) | `10·5·15분 미루기` Enabled |
-
-Tray/Menu 상태 규칙(IMP-09):
-| 상태 | 요약 라벨 | `Cancel Schedule` | `Snooze 10m` | `Quit App` |
-| --- | --- | --- | --- | --- |
-| Idle | `활성 스케줄 없음` | Enabled(no-op) | Enabled(요청 무시) | 즉시 종료 |
-| Armed | `자동 종료 대기 중` | Enabled | Enabled | `BLOCK_AND_CHOOSE` |
-| FinalWarning | `최종 경고 진행 중` | Enabled | Enabled | `BLOCK_AND_CHOOSE` |
-
-## URL Structure
-- `/dashboard`
-- `/schedule/new?mode=countdown`
-- `/schedule/new?mode=specific-time`
-- `/schedule/new?mode=process-exit`
-- `/schedule/active`
-- `/history`
-- `/settings/general`
-- `/settings/notifications`
-- `/settings/integrations/google`
-- `/help`
-
-## Naming Mapping (IMP-06)
-| URL 쿼리(kebab-case) | 내부 타입(camelCase) |
-| --- | --- |
-| `countdown` | `countdown` |
-| `specific-time` | `specificTime` |
-| `process-exit` | `processExit` |
-
-신규 모드/라우트 템플릿:
-- [ ] URL 토큰 추가(`/schedule/new?mode=...`)
-- [ ] 내부 타입/enum 추가
-- [ ] URL 파서 매핑 및 역직렬화 규칙 추가
-- [ ] PRD/Design/Use-Case/IA 동시 갱신
-
-## Responsive Policy (IMP-07)
-- MVP 최소 창 크기: `980x700`
-- 활성 브레이크포인트: `standard(980+)`, `desktop(1200+)`, `wide(1440+)`
-- `compact(480)` 구간은 현재 구현에서 도달 불가하므로 MVP IA에서 제외(v1.1 후보)
-
-## Component Hierarchy
+## 3) 글로벌 IA 구조
 ```text
 AppShellV2
-├─ SidebarNav
-├─ TopStatusBar
-├─ MainCanvas(Route Content)
-│  ├─ OnboardingViews
-│  ├─ DashboardView
-│  ├─ ScheduleBuilderView
-│  ├─ ActiveScheduleView
-│  ├─ HistoryView
-│  ├─ SettingsViews
-│  └─ HelpView
-├─ RightPanel(Summary/Detail)
-├─ QuickActionFooter
-├─ DetailDrawer
-├─ ConfirmModal / QuitGuardModal / FinalWarningOverlay
-└─ TrayMenuAdapter
+├─ Sidebar (그룹: 예약/기록/설정/도움말)
+├─ TopStatusBar (상태/남은 시간/종료 시각)
+├─ MainCanvas (라우트 콘텐츠)
+├─ RightPanel (화면 가이드 또는 이벤트 상세, wide)
+└─ QuickActionFooter (취소/미루기/새 예약)
 ```
 
-## Edge Cases
-- 프로세스 목록 비어 있음: Empty state + 새로고침 + 시간 기반 전환 CTA
-- shell 계열 동명이인: `Executable path` 또는 `Cmdline token` 미입력 시 Arm 차단 + 경고 배너 노출
-- 고급 매칭 정보 접근 불가: name fallback 허용 + degraded 이벤트 기록
-- process-exit 감시 selector 손상: `failed` 이벤트(`NO_FAIL_OPEN_PROCESS_EXIT`) 기록 후 스케줄 안전 중단
-- final warning 중 프로세스 재등장: 즉시 `armed` 롤백 후 종료 보류
-- process-exit 사전 알림: 시간 기반 모드와 달리 10m/5m/1m 사전 알림 없이 안정 구간 후 final warning으로 즉시 진입
-- process-exit 대체 안내: `프로세스 종료가 감지되어 최종 경고가 시작되었습니다.` 문구 노출
-- 권한/알림 차단: 경고 배너 + 트레이 폴백
-- 시스템 시간/타임존 변화: specific-time 재정렬
-- 절전/복귀: tick 재개 시 남은 시간 재계산
-- 재시작 후 상태 복구: 자동 재개 미지원(`resume_not_supported` 이벤트 + 배너)
-- 상태 파일 손상 복구 성공: 상단 배너 + `state_restored_from_backup` 이력
-- 상태 파일 손상 복구 실패(백업 없음): 안전 모드 배너 + `state_parse_failed` 이력
-- Google 연동(모의) 상태 저장 실패: 토글 롤백 + 오류 안내
-- 프라이버시 정책(목표): cmdline 원문/전체 경로 평문 로그 금지, 마스킹/해시 값만 허용
+고정 규칙:
+- TopStatusBar와 QuickActionFooter는 온보딩을 제외한 모든 화면에서 유지된다.
+- Armed/FinalWarning 상태에서는 라우트 이동과 무관하게 취소/미루기 경로가 보인다.
 
-## Assumptions
-- 로컬 저장소(파일/로컬 DB)만 사용, 서버 DB는 사용하지 않음
-- 기본 사전 알림(시간 기반): 10m/5m/1m
-- Notification은 info-only이며 액션은 앱/오버레이/트레이에서만 실행
-- 히스토리 저장 최대 250건(FIFO), UI 렌더는 페이지당 120건
-- 최소 창 크기: 980x700
-- 최종 경고 기본값 60초, 설정에서 15~300초 변경 가능
-- `simulateOnly=true`일 때 TopStatusBar에 `테스트 모드` 배지를 노출하고 설정 화면에 `테스트 모드(실제 종료 안 함)` 토글 문구를 노출
+## 4) 화면별 IA 스펙 (코드 기준)
+### 4.1 대시보드 (`/dashboard`)
+- 핵심 목적: 현재 상태와 즉시 행동을 한 화면에서 결정
+- 1차 정보: 상태 배지, 남은 시간, 종료 시각, 최근 이벤트
+- 레이아웃: 상태 액션 카드 + 현재 할 일 카드 + 최근 이벤트 리스트
+- Empty/Error/Loading:
+  - Empty: `예약이 없어요`
+  - Error: 상단 danger 배너
+  - Loading: Skeleton
+- 인터랙션: 이벤트 행 선택 시 상세 열기, `전체 보기`로 이력 이동
+- 마이크로카피: `지금 할 일`, `최근 이벤트`, `새 예약 만들기`
 
-## 문서 정본 규칙 (IMP-18)
-- 정본 세트: `PRD_MVP_v1.0.md`, `DESIGN_GUIDE_MVP_v1.0.md`, `USE_CASE_MVP_v1.0.md`, `IA_MVP_v1.0.md`
-- 공통 헤더 규칙: `Last synced with implementation` + `As-built Alignment`의 `Policy/As-built note` 분리 표기
-- 중복 문서가 생기면 정본 링크를 포함한 `DEPRECATED` 헤더를 추가하고 `/archive`로 이동한다.
+### 4.2 새 예약 (`/schedule/new`)
+- 핵심 목적: 모드 선택과 입력 검증 후 Arm 준비
+- 1차 정보: 현재 모드, 예상 종료(절대+상대), 검증 에러
+- 레이아웃: 모드 세그먼트 + 입력 폼 + 미리보기 카드
+- Empty/Error/Loading:
+  - process list empty: `검색 결과가 없습니다`
+  - process error: `프로세스 목록을 불러오지 못했습니다.`
+  - validation error: 인라인 배너
+- 인터랙션: `예약 준비` 클릭 시 Arm 확인 모달 진입
+- 마이크로카피: `모드 선택 → 값 입력 → 확인 모달`
 
-## Open Questions
-- v1.1+에서 알림 액션 버튼 도입 여부(현재 MVP 정책은 info-only 유지)
-- 배터리/절전 예외 규칙의 정책화 범위(강제 즉시 종료 vs 복귀 후 재확인)
-- v1.2 이후 다중 활성 스케줄 확장 필요성 검증(기본값은 단일 활성 유지)
+### 4.3 활성 예약 (`/schedule/active`)
+- 핵심 목적: 취소/미루기 즉시 실행 + 진행 타임라인 확인
+- 1차 정보: 상태, 남은 시간, 종료 시각, 취소/미루기 버튼
+- 레이아웃: 상태 카드 + 즉시 액션 카드 + 타임라인 카드
+- Empty/Error/Loading:
+  - Empty: `현재 활성 예약이 없습니다.`
+  - Error: action error 배너
+  - Loading: Skeleton
+- 인터랙션: `사용자 지정` 토글로 분 입력 필드 확장
+- 마이크로카피: `지금 할 수 있는 것`, `진행 타임라인`
 
+### 4.4 이력 (`/history`)
+- 핵심 목적: 이벤트를 빠르게 필터링하고 상세 원인을 확인
+- 1차 정보: 필터 상태, 검색어, 최신 이력 요약
+- 레이아웃: 필터/검색/정렬 툴바 + 이력 테이블 + 상세 드로어
+- Empty/Error/Loading:
+  - Empty: `조건에 맞는 이력이 없습니다.`
+  - Error: 상단 danger 배너
+  - Loading: Skeleton
+- 인터랙션: 테이블 행 Enter/클릭으로 상세, `더 보기 (120개)` 페이징
+- 마이크로카피: `정렬/필터/검색과 행 클릭 상세로 빠르게 스캔`
 
+### 4.5 일반 설정 (`/settings/general`)
+- 핵심 목적: 시뮬레이션/실종료 상태와 저장 정책 확인
+- 1차 정보: 시뮬레이션 상태 배지, 저장 위치, 이력 보관
+- 레이아웃: 안전/동작 카드 + 저장/기록 카드 + 단축키 카드
+- Empty/Error/Loading:
+  - Save success: `설정을 저장했습니다.`
+  - Save error: danger 배너
+  - Loading: Skeleton
+- 인터랙션: 토글 변경 후 `설정 저장`으로 확정
+- 마이크로카피: `시뮬레이션 모드(실제 종료 안 함)`
 
+### 4.6 알림 설정 (`/settings/notifications`)
+- 핵심 목적: 경고 임계값과 OS 알림 차단 상태 점검
+- 1차 정보: 사전 알림 칩, 최종 경고 초, 차단 배너
+- 레이아웃: 권한 배너 + 칩 그룹 + range/number 입력 + 미리보기
+- Empty/Error/Loading:
+  - Blocked: `종료 전 경고를 놓칠 수 있어요...`
+  - Save success: `설정을 저장했습니다.`
+  - Loading: Skeleton
+- 인터랙션: `알림 설정 열기` CTA, 값 범위 15~300
+- 마이크로카피: `최종 경고에서도 취소/미루기 가능`
 
+### 4.7 Google 연동 (`/settings/integrations/google`)
+- 핵심 목적: 옵션 연동 상태와 복구 액션 제공
+- 1차 정보: 연결 상태 배지, 연결/해제/재시도 가능 여부
+- 레이아웃: 단일 상태 카드 + 상태별 버튼
+- Empty/Error/Loading:
+  - 오프라인/토큰 만료: 복구 버튼 노출
+  - action error: 배너 노출
+  - Loading: Skeleton
+- 인터랙션: 상태 가드에 따라 `테스트 발송` 제한
+- 마이크로카피: `옵션 기능`, `토큰 만료 시뮬레이션`
 
+### 4.8 도움말 (`/help`)
+- 핵심 목적: 위험 동작 고지와 복구 경로 제공
+- 1차 정보: 취소/미루기 경로, FAQ, 링크 상태
+- 레이아웃: 안전 고지 + FAQ + 외부 링크 카드
+- Empty/Error/Loading:
+  - Offline: `오프라인에서는 열 수 없습니다.`
+  - 링크 실패: danger 배너
+  - Loading: Skeleton
+- 인터랙션: 오프라인 시 링크 카드 disabled
+- 마이크로카피: `안전 고지`, `FAQ / 문제 해결`
+
+## 5) 이벤트 카드/이력 스캔 표준
+규칙:
+1. 제목행: `[상태 배지] + 한 문장 요약`
+2. 메타행 칩: `[절대시각] [상대시간] [출처] [모드/조건]`
+3. 우측 정보는 `행동` 또는 `결과` 하나만 둔다.
+4. 시간 표시는 한 위치에만 두고 숫자는 tabular를 사용한다.
+
+예시:
+- `[사용자 취소] 예약이 취소됐어요`
+- `[2026-02-15 23:39:24] [2분 전] [출처: UI] [모드: 카운트다운]`
+- `[정상 처리] 예약이 정상 처리됐어요`
+
+## 6) 트레이/알림/종료 IA
+트레이 메뉴 고정 항목:
+- `Quick Start Last Mode`
+- `Show Countdown`
+- `Open Window`
+- `Cancel Schedule`
+- `Snooze 10m`
+- `Quit App`
+
+Quit Guard:
+- 상태가 `Armed` 또는 `FinalWarning`이면 즉시 종료 대신 선택 모달:
+  - `예약 취소 후 종료`
+  - `트레이 유지`
+  - `돌아가기`
+
+알림:
+- 데스크톱 알림은 정보형(info-only)으로 제공
+- 실행 액션은 앱 UI/최종 경고 오버레이/트레이에서 수행
+
+## 7) 반응형 IA
+- `compact(480)`, `standard(960)`, `desktop(1200)`, `wide(1440)` 토큰 유지
+- 앱 최소 창 크기 `980x700`이므로 compact는 QA 시뮬레이션 범주로 취급
+- 어떤 구간에서도 안전 액션은 우선순위 1이며 hidden 금지
+
+## 8) 연계 문서
+- PRD: [PRD_MVP_v1.0.md](./PRD_MVP_v1.0.md)
+- Use Case: [USE_CASE_MVP_v1.0.md](./USE_CASE_MVP_v1.0.md)
+- Design: [DESIGN_GUIDE_MVP_v1.0.md](./DESIGN_GUIDE_MVP_v1.0.md)
+- Operations: [RUNBOOK.md](./RUNBOOK.md)
+- Artifacts: [../artifacts/verification/](../artifacts/verification/), [../artifacts/handoff/](../artifacts/handoff/)

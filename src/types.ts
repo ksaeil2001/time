@@ -42,6 +42,7 @@ export interface ActiveSchedule {
   status: ScheduleStatus;
   finalWarningStartedAtMs?: number;
   finalWarningDurationSec: number;
+  shutdownAtMs?: number;
 }
 
 export interface ExecutionEvent {

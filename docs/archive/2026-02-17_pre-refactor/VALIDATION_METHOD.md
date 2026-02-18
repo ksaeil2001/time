@@ -1,3 +1,6 @@
+﻿> STATUS: ARCHIVED
+> Snapshot date: 2026-02-17
+> 원본 출처: C:\Users\ksaei\workspace\time\docs\archive\2026-02-17_pre-refactor\VALIDATION_METHOD.md
 # Auto Shutdown Scheduler Validation Method (STEP 3)
 
 > Last synced with implementation: 2026-02-16 (commit N/A - git metadata unavailable)
@@ -194,3 +197,4 @@
 3. 수동 시나리오(1~7) 수행
 4. 정량/정성 기준 판정 기록
 5. 회귀 포인트(P0/P1/P2) 체크 후 릴리즈 승인
+

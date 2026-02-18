@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "generated_at": "2026-02-16T19:04:06.388Z",
+  "repo_root": "C:/Users/ksaei/workspace/time",
+  "origin_url": "https://github.com/ksaeil2001/time.git",
+  "branch": "main",
+  "identity_hash": "f23765b8c24ebd768f5b345a416c981f8e4330bf5d789a256571bb7366966abf",
+  "checks": [
+    {
+      "name": "origin_url",
+      "status": "pass",
+      "detail": "https://github.com/ksaeil2001/time.git"
+    },
+    {
+      "name": "branch",
+      "status": "pass",
+      "detail": "main"
+    },
+    {
+      "name": "git_dirty",
+      "status": "warn",
+      "detail": "작업 트리가 dirty 상태입니다. 변경 파일 10개"
+    },
+    {
+      "name": "remote_branch",
+      "status": "pass",
+      "detail": "origin/main 브랜치가 존재합니다."
+    },
+    {
+      "name": "identity_hash",
+      "status": "pass",
+      "detail": "조직/토큰/환경 식별자 해시를 생성했습니다."
+    }
+  ]
+}

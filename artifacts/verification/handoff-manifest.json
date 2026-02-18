@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-02-16T19:04:36.229Z",
+  "repo_root": "C:/Users/ksaei/workspace/time",
+  "origin_url": "https://github.com/ksaeil2001/time.git",
+  "branch": "main",
+  "base_sha": "db40591a92cad326c07b2a82a2cc71ac10aace9d",
+  "head_sha": "db40591a92cad326c07b2a82a2cc71ac10aace9d",
+  "result": "pass",
+  "summary": "verify pipeline passed",
+  "identity_hash": "f23765b8c24ebd768f5b345a416c981f8e4330bf5d789a256571bb7366966abf",
+  "preflight": [
+    {
+      "name": "origin_url",
+      "status": "pass",
+      "detail": "https://github.com/ksaeil2001/time.git"
+    },
+    {
+      "name": "branch",
+      "status": "pass",
+      "detail": "main"
+    },
+    {
+      "name": "git_dirty",
+      "status": "warn",
+      "detail": "작업 트리가 dirty 상태입니다. 변경 파일 10개"
+    },
+    {
+      "name": "remote_branch",
+      "status": "pass",
+      "detail": "origin/main 브랜치가 존재합니다."
+    },
+    {
+      "name": "identity_hash",
+      "status": "pass",
+      "detail": "조직/토큰/환경 식별자 해시를 생성했습니다."
+    }
+  ],
+  "verification_commands": [
+    {
+      "command": "npm run lint",
+      "status": "pass",
+      "started_at": "2026-02-16T19:04:06.399Z",
+      "ended_at": "2026-02-16T19:04:10.231Z",
+      "message": ""
+    },
+    {
+      "command": "npm run typecheck",
+      "status": "pass",
+      "started_at": "2026-02-16T19:04:10.231Z",
+      "ended_at": "2026-02-16T19:04:13.681Z",
+      "message": ""
+    },
+    {
+      "command": "npm run test",
+      "status": "pass",
+      "started_at": "2026-02-16T19:04:13.681Z",
+      "ended_at": "2026-02-16T19:04:18.766Z",
+      "message": ""
+    },
+    {
+      "command": "npm run build",
+      "status": "pass",
+      "started_at": "2026-02-16T19:04:18.766Z",
+      "ended_at": "2026-02-16T19:04:23.841Z",
+      "message": ""
+    },
+    {
+      "command": "npm run test:e2e",
+      "status": "pass",
+      "started_at": "2026-02-16T19:04:23.841Z",
+      "ended_at": "2026-02-16T19:04:35.896Z",
+      "message": ""
+    }
+  ]
+}

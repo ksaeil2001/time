@@ -1,17 +1,17 @@
 ﻿
+mod process_scan;
+mod scheduler;
+
 use chrono::{Days, Local, LocalResult, NaiveTime, TimeZone};
+use process_scan::ProcessScanner;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
-    thread,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -26,6 +26,8 @@ const FINAL_WARNING_MIN_SEC: u64 = 15;
 const FINAL_WARNING_MAX_SEC: u64 = 300;
 const FINAL_WARNING_RANGE_ERROR: &str =
     "최종 경고 시간은 15초에서 300초 사이로 설정해 주세요.";
+#[cfg(target_os = "windows")]
+const WINDOWS_ABORTABLE_SHUTDOWN_SEC: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +89,8 @@ struct ActiveSchedule {
     status: ScheduleStatus,
     final_warning_started_at_ms: Option<i64>,
     final_warning_duration_sec: u64,
+    #[serde(default)]
+    shutdown_at_ms: Option<i64>,
     #[serde(default)]
     shutdown_initiated_at_ms: Option<i64>,
 }
@@ -209,6 +213,28 @@ struct RuntimeState {
     allow_exit_once: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ShutdownDispatchReport {
+    command_line: String,
+    abort_hint: Option<String>,
+    dry_run: bool,
+}
+
+impl ShutdownDispatchReport {
+    fn log_line(&self) -> String {
+        let prefix = if self.dry_run {
+            "DRY_RUN_SHUTDOWN_COMMAND"
+        } else {
+            "SHUTDOWN_COMMAND_SENT"
+        };
+
+        match &self.abort_hint {
+            Some(abort) => format!("{prefix}: {} (abort: {abort})", self.command_line),
+            None => format!("{prefix}: {}", self.command_line),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuitGuardPayload {
@@ -268,6 +294,7 @@ struct AppState {
     state_path: PathBuf,
     store: Mutex<SchedulerStore>,
     runtime: Mutex<RuntimeState>,
+    scanner: Arc<Mutex<ProcessScanner>>,
 }
 
 struct LoadStoreOutcome {
@@ -278,7 +305,7 @@ struct LoadStoreOutcome {
 
 impl AppState {
     fn snapshot(&self) -> SchedulerSnapshot {
-        let store = self.store.lock().expect("scheduler state mutex poisoned");
+        let store = lock_store(&self.store);
         SchedulerSnapshot {
             active: store.active.clone(),
             settings: store.settings.clone(),
@@ -292,11 +319,53 @@ impl AppState {
     }
 }
 
+fn lock_store(store: &Mutex<SchedulerStore>) -> MutexGuard<'_, SchedulerStore> {
+    match store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut recovered = poisoned.into_inner();
+            push_event(
+                &mut recovered,
+                None,
+                "mutex_poison_recovered",
+                "error",
+                Some(
+                    "scheduler state mutex poisoned; recovered with inner state to keep app running"
+                        .to_string(),
+                ),
+            );
+            recovered
+        }
+    }
+}
+
+fn lock_runtime(runtime: &Mutex<RuntimeState>) -> MutexGuard<'_, RuntimeState> {
+    match runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_scanner(scanner: &Arc<Mutex<ProcessScanner>>) -> MutexGuard<'_, ProcessScanner> {
+    match scanner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn now_ms() -> i64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     duration.as_millis() as i64
+}
+
+fn format_local_timestamp_ms(timestamp_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| timestamp_ms.to_string())
 }
 
 fn normalize_final_warning_sec(value: u64) -> u64 {
@@ -315,11 +384,36 @@ fn validate_final_warning_sec(value: u64) -> Result<u64, String> {
     }
 }
 
+fn compute_shutdown_at_ms(active: &ActiveSchedule) -> Option<i64> {
+    match active.status {
+        ScheduleStatus::Armed => match active.mode {
+            ScheduleMode::Countdown | ScheduleMode::SpecificTime => active
+                .trigger_at_ms
+                .and_then(|trigger| trigger.checked_add((active.final_warning_duration_sec as i64) * 1000)),
+            ScheduleMode::ProcessExit => None,
+        },
+        ScheduleStatus::FinalWarning | ScheduleStatus::ShuttingDown => active
+            .final_warning_started_at_ms
+            .and_then(|started| started.checked_add((active.final_warning_duration_sec as i64) * 1000)),
+    }
+}
+
+fn sync_shutdown_at_ms(active: &mut ActiveSchedule) -> bool {
+    let computed = compute_shutdown_at_ms(active);
+    if active.shutdown_at_ms != computed {
+        active.shutdown_at_ms = computed;
+        true
+    } else {
+        false
+    }
+}
+
 fn sanitize_active_for_persist(mut active: ActiveSchedule) -> ActiveSchedule {
     active.final_warning_duration_sec = normalize_final_warning_sec(active.final_warning_duration_sec);
     if matches!(active.status, ScheduleStatus::ShuttingDown) {
         active.status = ScheduleStatus::FinalWarning;
     }
+    let _ = sync_shutdown_at_ms(&mut active);
     active
 }
 
@@ -338,6 +432,7 @@ fn sanitize_active_from_persist(
     } else {
         active.final_warning_duration_sec
     };
+    let _ = sync_shutdown_at_ms(&mut active);
     active
 }
 
@@ -728,7 +823,7 @@ fn build_active_schedule(
     store.id_seq += 1;
     let id = format!("sch-{}-{}", now, store.id_seq);
 
-    Ok(ActiveSchedule {
+    let mut next = ActiveSchedule {
         id,
         mode,
         summary,
@@ -747,8 +842,11 @@ fn build_active_schedule(
         status: ScheduleStatus::Armed,
         final_warning_started_at_ms: None,
         final_warning_duration_sec: normalize_final_warning_sec(store.settings.final_warning_sec),
+        shutdown_at_ms: None,
         shutdown_initiated_at_ms: None,
-    })
+    };
+    let _ = sync_shutdown_at_ms(&mut next);
+    Ok(next)
 }
 
 fn resolve_state_path(app: &AppHandle) -> PathBuf {
@@ -762,50 +860,6 @@ fn resolve_state_path(app: &AppHandle) -> PathBuf {
 
 fn send_desktop_notification(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
-}
-
-fn list_running_processes() -> Vec<ProcessInfo> {
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    let mut processes = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| ProcessInfo {
-            pid: pid.as_u32(),
-            name: process.name().to_string_lossy().to_string(),
-            executable: process.exe().map(|path| path.display().to_string()),
-        })
-        .filter(|item| !item.name.is_empty())
-        .collect::<Vec<_>>();
-
-    processes.sort_by(|left, right| left.name.cmp(&right.name).then(left.pid.cmp(&right.pid)));
-    processes
-}
-
-fn collect_process_tree_pids(system: &System, root_pid: Pid) -> Vec<u32> {
-    let mut stack = vec![root_pid];
-    let mut visited = HashSet::<Pid>::new();
-    let mut collected = Vec::<u32>::new();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-
-        if system.process(current).is_none() {
-            continue;
-        }
-
-        collected.push(current.as_u32());
-        for (candidate_pid, candidate_process) in system.processes() {
-            if candidate_process.parent() == Some(current) {
-                stack.push(*candidate_pid);
-            }
-        }
-    }
-
-    collected
 }
 
 fn normalize_selector_text(value: Option<&String>) -> Option<String> {
@@ -896,149 +950,7 @@ fn is_shell_like_process_name(name: &str) -> bool {
         || normalized.ends_with("/sh")
 }
 
-fn is_process_running(
-    selector: &ProcessSelector,
-    tracked_pids: &mut Vec<u32>,
-) -> ProcessMatchResult {
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    let selector_name =
-        normalize_selector_text(selector.name.as_ref()).map(|name| name.to_lowercase());
-    let selector_executable = normalize_selector_path(selector.executable.as_ref());
-    let selector_cmdline =
-        normalize_selector_text(selector.cmdline_contains.as_ref()).map(|item| item.to_lowercase());
-    let allow_name_fallback = selector_name
-        .as_ref()
-        .map(|name| {
-            !is_shell_like_process_name(name)
-                || selector_executable.is_some()
-                || selector_cmdline.is_some()
-        })
-        .unwrap_or(false);
-
-    let advanced_requested = selector_executable.is_some() || selector_cmdline.is_some();
-    let mut advanced_data_unavailable = false;
-    let mut running = false;
-    let mut source = ProcessMatchSource::None;
-    let mut next_tracked = tracked_pids.iter().copied().collect::<HashSet<u32>>();
-
-    if let Some(pid) = selector.pid {
-        let tree = collect_process_tree_pids(&system, Pid::from_u32(pid));
-        if !tree.is_empty() {
-            running = true;
-            source = ProcessMatchSource::PidTree;
-            next_tracked.extend(tree);
-        }
-    }
-
-    next_tracked = next_tracked
-        .into_iter()
-        .filter(|pid| system.process(Pid::from_u32(*pid)).is_some())
-        .collect();
-
-    if !running {
-        if !next_tracked.is_empty() {
-            running = true;
-            source = ProcessMatchSource::TrackedPids;
-        }
-    }
-
-    if !running && advanced_requested {
-        let advanced_match = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| {
-                let executable_match = if let Some(expected) = selector_executable.as_ref() {
-                    match process.exe() {
-                        Some(actual_path) => actual_path
-                            .display()
-                            .to_string()
-                            .replace('\\', "/")
-                            .to_lowercase()
-                            == *expected,
-                        None => {
-                            advanced_data_unavailable = true;
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
-
-                if !executable_match {
-                    return None;
-                }
-
-                let cmdline_match = if let Some(token) = selector_cmdline.as_ref() {
-                    let cmdline = process.cmd();
-                    if cmdline.is_empty() {
-                        advanced_data_unavailable = true;
-                        false
-                    } else {
-                        cmdline
-                            .iter()
-                            .map(|part| part.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .to_lowercase()
-                            .contains(token)
-                    }
-                } else {
-                    true
-                };
-
-                if cmdline_match {
-                    Some(pid.as_u32())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if !advanced_match.is_empty() {
-            running = true;
-            source = ProcessMatchSource::Advanced;
-            next_tracked.extend(advanced_match);
-        }
-    }
-
-    if !running && allow_name_fallback {
-        if let Some(needle) = selector_name.as_ref() {
-            let by_name = system
-                .processes()
-                .iter()
-                .filter_map(|(pid, process)| {
-                    if process.name().to_string_lossy().to_lowercase() == *needle {
-                        Some(pid.as_u32())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !by_name.is_empty() {
-                running = true;
-                source = ProcessMatchSource::NameFallback;
-                next_tracked.extend(by_name);
-            }
-        }
-    }
-
-    let mut normalized = next_tracked.into_iter().collect::<Vec<_>>();
-    normalized.sort_unstable();
-    *tracked_pids = normalized;
-
-    ProcessMatchResult {
-        running,
-        matched_pids: tracked_pids.clone(),
-        source,
-        degraded_to_name: advanced_requested
-            && advanced_data_unavailable
-            && source == ProcessMatchSource::NameFallback,
-    }
-}
-
-fn run_shutdown_command(settings: &AppSettings) -> Result<(), String> {
+fn run_shutdown_command(settings: &AppSettings) -> Result<ShutdownDispatchReport, String> {
     let force_simulate = std::env::var("AUTOSD_FORCE_SIMULATE_ONLY")
         .map(|value| {
             let normalized = value.trim().to_ascii_lowercase();
@@ -1049,18 +961,41 @@ fn run_shutdown_command(settings: &AppSettings) -> Result<(), String> {
             .map(|value| value.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-    if settings.simulate_only || force_simulate {
-        return Ok(());
+    #[cfg(target_os = "windows")]
+    let dispatch = ShutdownDispatchReport {
+        command_line: format!("shutdown /s /t {WINDOWS_ABORTABLE_SHUTDOWN_SEC}"),
+        abort_hint: Some("shutdown /a".to_string()),
+        dry_run: settings.simulate_only || force_simulate,
+    };
+
+    #[cfg(target_os = "macos")]
+    let dispatch = ShutdownDispatchReport {
+        command_line: "osascript -e \"tell application \\\"System Events\\\" to shut down\""
+            .to_string(),
+        abort_hint: None,
+        dry_run: settings.simulate_only || force_simulate,
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let dispatch = ShutdownDispatchReport {
+        command_line: "shutdown command unsupported on this OS".to_string(),
+        abort_hint: None,
+        dry_run: settings.simulate_only || force_simulate,
+    };
+
+    if dispatch.dry_run {
+        return Ok(dispatch);
     }
 
     #[cfg(target_os = "windows")]
     {
+        let timeout_arg = WINDOWS_ABORTABLE_SHUTDOWN_SEC.to_string();
         let status = Command::new("shutdown")
-            .args(["/s", "/t", "0"])
+            .args(["/s", "/t", timeout_arg.as_str()])
             .status()
             .map_err(|error| format!("failed to run windows shutdown command: {error}"))?;
         if status.success() {
-            return Ok(());
+            return Ok(dispatch);
         }
         return Err(format!("windows shutdown failed with status: {status}"));
     }
@@ -1072,7 +1007,7 @@ fn run_shutdown_command(settings: &AppSettings) -> Result<(), String> {
             .status()
             .map_err(|error| format!("failed to run macOS shutdown command: {error}"))?;
         if status.success() {
-            return Ok(());
+            return Ok(dispatch);
         }
         return Err(format!("macOS shutdown failed with status: {status}"));
     }
@@ -1089,7 +1024,7 @@ fn cancel_active_schedule_internal(
     emit_notification: bool,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+    let mut store = lock_store(&state.store);
     let Some(active) = store.active.as_ref() else {
         return Ok(());
     };
@@ -1123,7 +1058,7 @@ fn postpone_schedule_internal(app: &AppHandle, minutes: u64, reason: &str) -> Re
     }
 
     let state = app.state::<AppState>();
-    let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+    let mut store = lock_store(&state.store);
     let Some(active) = store.active.as_mut() else {
         return Err("no active schedule to postpone".to_string());
     };
@@ -1158,6 +1093,7 @@ fn postpone_schedule_internal(app: &AppHandle, minutes: u64, reason: &str) -> Re
         active.process_match_degraded_logged = false;
         active.shutdown_initiated_at_ms = None;
     }
+    let _ = sync_shutdown_at_ms(active);
 
     push_event(
         &mut store,
@@ -1180,7 +1116,7 @@ fn postpone_schedule_internal(app: &AppHandle, minutes: u64, reason: &str) -> Re
 fn execute_active_shutdown(app: &AppHandle, schedule_id: String) {
     let state = app.state::<AppState>();
     let settings = {
-        let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+        let mut store = lock_store(&state.store);
         let now = now_ms();
 
         let Some(active) = store.active.as_mut() else {
@@ -1194,6 +1130,7 @@ fn execute_active_shutdown(app: &AppHandle, schedule_id: String) {
         if !try_mark_shutdown_initiated(active, now) {
             return;
         }
+        let _ = sync_shutdown_at_ms(active);
 
         push_event(
             &mut store,
@@ -1215,21 +1152,16 @@ fn execute_active_shutdown(app: &AppHandle, schedule_id: String) {
 
     let result = run_shutdown_command(&settings);
 
-    let mut store = state.store.lock().expect("scheduler state mutex poisoned");
-    let reason = if settings.simulate_only {
-        Some("simulateOnly mode recorded execution without shutting down".to_string())
-    } else {
-        None
-    };
-
+    let mut store = lock_store(&state.store);
     match result {
-        Ok(()) => {
+        Ok(dispatch) => {
+            let event_reason = Some(dispatch.log_line());
             push_event(
                 &mut store,
                 Some(schedule_id.clone()),
                 "executed",
                 "ok",
-                reason,
+                event_reason,
             );
             if store
                 .active
@@ -1240,11 +1172,14 @@ fn execute_active_shutdown(app: &AppHandle, schedule_id: String) {
                 store.active = None;
             }
             let _ = state.persist_locked(&store);
-            if settings.simulate_only {
+            if dispatch.dry_run {
                 send_desktop_notification(
                     app,
                     "Auto Shutdown Scheduler",
-                    "Simulated shutdown executed. Disable simulateOnly to perform real shutdown.",
+                    &format!(
+                        "Dry run complete. {}",
+                        dispatch.log_line()
+                    ),
                 );
             }
         }
@@ -1276,12 +1211,63 @@ fn tick_scheduler(app: &AppHandle) {
         body: String,
     }
 
+    enum ProcessScanState {
+        NotRequested,
+        Invalid {
+            schedule_id: String,
+            status: ScheduleStatus,
+            reason: String,
+        },
+        Ready {
+            schedule_id: String,
+            status: ScheduleStatus,
+            result: ProcessMatchResult,
+        },
+    }
+
     let mut notifications = Vec::<PendingNotification>::new();
     let mut should_execute = None::<String>;
     let state = app.state::<AppState>();
+    let scan_state = {
+        let store = lock_store(&state.store);
+        let Some(active) = store.active.as_ref() else {
+            return;
+        };
+
+        if !matches!(active.mode, ScheduleMode::ProcessExit)
+            || !matches!(active.status, ScheduleStatus::Armed | ScheduleStatus::FinalWarning)
+        {
+            ProcessScanState::NotRequested
+        } else {
+            match normalize_and_validate_process_selector(active.process_selector.as_ref()) {
+                Ok(selector) => {
+                    let schedule_id = active.id.clone();
+                    let status = active.status.clone();
+                    let tracked_pids = active.process_tree_pids.clone();
+
+                    drop(store);
+                    let result = {
+                        let mut scanner = lock_scanner(&state.scanner);
+                        scanner.is_process_running(&selector, &tracked_pids)
+                    };
+
+                    ProcessScanState::Ready {
+                        schedule_id,
+                        status,
+                        result,
+                    }
+                }
+                Err(error) => ProcessScanState::Invalid {
+                    schedule_id: active.id.clone(),
+                    status: active.status.clone(),
+                    reason: no_fail_open_process_exit_reason(&error),
+                },
+            }
+        }
+    };
 
     {
-        let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+        let mut store = lock_store(&state.store);
         let Some(active) = store.active.as_mut() else {
             return;
         };
@@ -1348,7 +1334,7 @@ fn tick_scheduler(app: &AppHandle) {
                             changed = true;
                             pending_events.push((
                                 "final_warning".to_string(),
-                                Some("entered final warning stage".to_string()),
+                                Some("entered shutdown waiting mode (final warning stage)".to_string()),
                             ));
                             notifications.push(PendingNotification {
                                 title: "Auto Shutdown Scheduler".to_string(),
@@ -1366,136 +1352,143 @@ fn tick_scheduler(app: &AppHandle) {
                             changed = true;
                         }
                     }
+                    match &scan_state {
+                        ProcessScanState::Ready {
+                            schedule_id: scanned_id,
+                            status,
+                            result,
+                        } if scanned_id == &schedule_id && status == &active.status => {
+                            let match_result = result.clone();
+                            active.process_tree_pids = match_result.matched_pids.clone();
 
-                    let selector = match normalize_and_validate_process_selector(
-                        active.process_selector.as_ref(),
-                    ) {
-                        Ok(selector) => Some(selector),
-                        Err(error) => {
-                            if fail_safe_cancel_reason.is_none() {
-                                fail_safe_cancel_reason =
-                                    Some(no_fail_open_process_exit_reason(&error));
-                            }
-                            reset_process_exit_on_selector_failure(active);
-                            changed = true;
-                            None
-                        }
-                    };
-
-                    if let Some(selector) = selector {
-                        let match_result =
-                            is_process_running(&selector, &mut active.process_tree_pids);
-                        active.process_tree_pids = match_result.matched_pids.clone();
-
-                        if match_result.degraded_to_name && !active.process_match_degraded_logged {
-                            active.process_match_degraded_logged = true;
-                            changed = true;
-                            pending_events.push((
-                                "process_match_degraded".to_string(),
-                                Some(
-                                    "advanced process matching unavailable; fell back to name matching"
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-
-                        if match_result.running {
-                            if active.process_missing_since_ms.is_some() {
-                                active.process_missing_since_ms = None;
+                            if match_result.degraded_to_name && !active.process_match_degraded_logged
+                            {
+                                active.process_match_degraded_logged = true;
                                 changed = true;
-                            }
-                        } else {
-                            if active.process_missing_since_ms.is_none() {
-                                active.process_missing_since_ms = Some(now);
-                                changed = true;
+                                pending_events.push((
+                                    "process_match_degraded".to_string(),
+                                    Some(
+                                        "advanced process matching unavailable; fell back to name matching"
+                                            .to_string(),
+                                    ),
+                                ));
                             }
 
-                            let missing_for = now - active.process_missing_since_ms.unwrap_or(now);
-                            if missing_for >= (active.process_stable_sec as i64) * 1000 {
-                                let snoozed = active
-                                    .snooze_until_ms
-                                    .map(|snooze_until_ms| now < snooze_until_ms)
-                                    .unwrap_or(false);
-
-                                if !snoozed {
-                                    active.status = ScheduleStatus::FinalWarning;
-                                    active.final_warning_started_at_ms = Some(now);
+                            if match_result.running {
+                                if active.process_missing_since_ms.is_some() {
                                     active.process_missing_since_ms = None;
-                                    active.shutdown_initiated_at_ms = None;
                                     changed = true;
-                                    pending_events.push((
-                                        "final_warning".to_string(),
-                                        Some("target process exited".to_string()),
-                                    ));
-                                    notifications.push(PendingNotification {
-                                        title: "Auto Shutdown Scheduler".to_string(),
-                                        body: process_exit_final_warning_notification_body(
-                                            active.final_warning_duration_sec,
-                                        ),
-                                    });
+                                }
+                            } else {
+                                if active.process_missing_since_ms.is_none() {
+                                    active.process_missing_since_ms = Some(now);
+                                    changed = true;
+                                }
+
+                                let missing_for =
+                                    now - active.process_missing_since_ms.unwrap_or(now);
+                                if missing_for >= (active.process_stable_sec as i64) * 1000 {
+                                    let snoozed = active
+                                        .snooze_until_ms
+                                        .map(|snooze_until_ms| now < snooze_until_ms)
+                                        .unwrap_or(false);
+
+                                    if !snoozed {
+                                        active.status = ScheduleStatus::FinalWarning;
+                                        active.final_warning_started_at_ms = Some(now);
+                                        active.process_missing_since_ms = None;
+                                        active.shutdown_initiated_at_ms = None;
+                                        changed = true;
+                                        pending_events.push((
+                                            "final_warning".to_string(),
+                                            Some("target process exited; entered shutdown waiting mode".to_string()),
+                                        ));
+                                        notifications.push(PendingNotification {
+                                            title: "Auto Shutdown Scheduler".to_string(),
+                                            body: process_exit_final_warning_notification_body(
+                                                active.final_warning_duration_sec,
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }
+                        ProcessScanState::Invalid {
+                            schedule_id: scanned_id,
+                            status,
+                            reason,
+                        } if scanned_id == &schedule_id && status == &active.status => {
+                            if fail_safe_cancel_reason.is_none() {
+                                fail_safe_cancel_reason = Some(reason.clone());
+                            }
+                            reset_process_exit_on_selector_failure(active);
+                            changed = true;
+                        }
+                        ProcessScanState::Ready { .. } | ProcessScanState::Invalid { .. } => {}
+                        ProcessScanState::NotRequested => {}
                     }
                 }
             },
             ScheduleStatus::FinalWarning => {
                 let mut reverted = false;
                 if matches!(active.mode, ScheduleMode::ProcessExit) {
-                    let selector = match normalize_and_validate_process_selector(
-                        active.process_selector.as_ref(),
-                    ) {
-                        Ok(selector) => Some(selector),
-                        Err(error) => {
+                    match &scan_state {
+                        ProcessScanState::Ready {
+                            schedule_id: scanned_id,
+                            status,
+                            result,
+                        } if scanned_id == &schedule_id && status == &active.status => {
+                            let match_result = result.clone();
+                            active.process_tree_pids = match_result.matched_pids.clone();
+
+                            if match_result.degraded_to_name && !active.process_match_degraded_logged {
+                                active.process_match_degraded_logged = true;
+                                changed = true;
+                                pending_events.push((
+                                    "process_match_degraded".to_string(),
+                                    Some(
+                                        "advanced process matching unavailable; fell back to name matching"
+                                            .to_string(),
+                                    ),
+                                ));
+                            }
+
+                            if match_result.running {
+                                active.status = ScheduleStatus::Armed;
+                                active.final_warning_started_at_ms = None;
+                                active.process_missing_since_ms = None;
+                                active.shutdown_initiated_at_ms = None;
+                                changed = true;
+                                reverted = true;
+                                pending_events.push((
+                                    "final_warning_reverted".to_string(),
+                                    Some(format!(
+                                        "target process detected again ({})",
+                                        process_match_source_label(match_result.source)
+                                    )),
+                                ));
+                                notifications.push(PendingNotification {
+                                    title: "Auto Shutdown Scheduler".to_string(),
+                                    body: "감시 대상이 다시 실행되어 종료를 보류했습니다.".to_string(),
+                                });
+                            }
+                        }
+                        ProcessScanState::Invalid {
+                            schedule_id: scanned_id,
+                            status,
+                            reason,
+                        } if scanned_id == &schedule_id && status == &active.status => {
                             if fail_safe_cancel_reason.is_none() {
-                                fail_safe_cancel_reason =
-                                    Some(no_fail_open_process_exit_reason(&error));
+                                fail_safe_cancel_reason = Some(reason.clone());
                             }
                             reset_process_exit_on_selector_failure(active);
                             changed = true;
                             reverted = true;
-                            None
                         }
-                    };
-
-                    if let Some(selector) = selector {
-                        let match_result =
-                            is_process_running(&selector, &mut active.process_tree_pids);
-                        active.process_tree_pids = match_result.matched_pids.clone();
-
-                        if match_result.degraded_to_name
-                            && !active.process_match_degraded_logged
-                        {
-                            active.process_match_degraded_logged = true;
-                            changed = true;
-                            pending_events.push((
-                                "process_match_degraded".to_string(),
-                                Some(
-                                    "advanced process matching unavailable; fell back to name matching"
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-
-                        if match_result.running {
-                            active.status = ScheduleStatus::Armed;
-                            active.final_warning_started_at_ms = None;
-                            active.process_missing_since_ms = None;
-                            active.shutdown_initiated_at_ms = None;
-                            changed = true;
+                        ProcessScanState::Ready { .. } | ProcessScanState::Invalid { .. } => {
                             reverted = true;
-                            pending_events.push((
-                                "final_warning_reverted".to_string(),
-                                Some(format!(
-                                    "target process detected again ({})",
-                                    process_match_source_label(match_result.source)
-                                )),
-                            ));
-                            notifications.push(PendingNotification {
-                                title: "Auto Shutdown Scheduler".to_string(),
-                                body: "감시 대상이 다시 실행되어 종료를 보류했습니다.".to_string(),
-                            });
                         }
+                        ProcessScanState::NotRequested => {}
                     }
                 }
 
@@ -1512,6 +1505,9 @@ fn tick_scheduler(app: &AppHandle) {
                 }
             }
             ScheduleStatus::ShuttingDown => {}
+        }
+        if sync_shutdown_at_ms(active) {
+            changed = true;
         }
 
         for (event_type, reason) in pending_events {
@@ -1544,10 +1540,7 @@ fn tick_scheduler(app: &AppHandle) {
 }
 
 fn start_scheduler_loop(app: AppHandle) {
-    thread::spawn(move || loop {
-        tick_scheduler(&app);
-        thread::sleep(Duration::from_secs(1));
-    });
+    scheduler::start_scheduler_loop(app, tick_scheduler);
 }
 
 fn upsert_active_schedule(
@@ -1603,7 +1596,7 @@ fn default_quick_start_request(settings: &AppSettings) -> ScheduleRequest {
 fn emit_tray_quick_start_request(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let request = {
-        let store = state.store.lock().expect("scheduler state mutex poisoned");
+        let store = lock_store(&state.store);
         store
             .last_schedule_request
             .clone()
@@ -1627,7 +1620,7 @@ fn is_quit_guard_status(status: &ScheduleStatus) -> bool {
 
 fn active_status_requiring_quit_guard(app: &AppHandle) -> Option<ScheduleStatus> {
     let state = app.state::<AppState>();
-    let store = state.store.lock().expect("scheduler state mutex poisoned");
+    let store = lock_store(&state.store);
     store
         .active
         .as_ref()
@@ -1643,13 +1636,13 @@ fn open_main_window(app: &AppHandle) {
 }
 
 fn set_allow_exit_once(state: &tauri::State<AppState>, allow: bool) {
-    let mut runtime = state.runtime.lock().expect("runtime state mutex poisoned");
+    let mut runtime = lock_runtime(&state.runtime);
     runtime.allow_exit_once = allow;
 }
 
 fn consume_allow_exit_once(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
-    let mut runtime = state.runtime.lock().expect("runtime state mutex poisoned");
+    let mut runtime = lock_runtime(&state.runtime);
     if runtime.allow_exit_once {
         runtime.allow_exit_once = false;
         true
@@ -1738,21 +1731,19 @@ fn apply_quit_guard_action(
 
 fn show_countdown_from_tray(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let store = state.store.lock().expect("scheduler state mutex poisoned");
+    let store = lock_store(&state.store);
     let now = now_ms();
 
     let message = if let Some(active) = store.active.as_ref() {
         if active.status == ScheduleStatus::ShuttingDown {
             "종료 명령 실행 중".to_string()
-        } else if active.status == ScheduleStatus::FinalWarning {
-            let remaining = active
-                .final_warning_started_at_ms
-                .map(|started| {
-                    let elapsed = ((now - started).max(0) / 1000) as u64;
-                    active.final_warning_duration_sec.saturating_sub(elapsed)
-                })
-                .unwrap_or(active.final_warning_duration_sec);
-            format!("최종 경고 진행 중 · {remaining}초 남음")
+        } else if let Some(shutdown_at_ms) = active.shutdown_at_ms {
+            let remaining = ((shutdown_at_ms - now).max(0) / 1000) as u64;
+            format!(
+                "종료 예정 {} · {}초 남음",
+                format_local_timestamp_ms(shutdown_at_ms),
+                remaining
+            )
         } else if let Some(trigger_at_ms) = active.trigger_at_ms {
             let remaining = ((trigger_at_ms - now).max(0) / 1000) as u64;
             format!("자동 종료 대기 중 · {remaining}초 남음")
@@ -1842,8 +1833,14 @@ fn get_scheduler_snapshot(state: tauri::State<AppState>) -> SchedulerSnapshot {
 }
 
 #[tauri::command]
-fn list_processes() -> Vec<ProcessInfo> {
-    list_running_processes()
+async fn list_processes(state: tauri::State<'_, AppState>) -> Result<Vec<ProcessInfo>, String> {
+    let scanner = Arc::clone(&state.scanner);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut scanner = lock_scanner(&scanner);
+        Ok(scanner.list_running_processes())
+    })
+    .await
+    .map_err(|error| format!("failed to join list_processes worker: {error}"))?
 }
 
 #[tauri::command]
@@ -1852,7 +1849,7 @@ fn arm_schedule(
     state: tauri::State<AppState>,
     request: ScheduleRequest,
 ) -> Result<SchedulerSnapshot, String> {
-    let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+    let mut store = lock_store(&state.store);
     let previous_store = store.clone();
     let had_active_before = previous_store.active.is_some();
     let summary = upsert_active_schedule(&mut store, request)?;
@@ -1926,7 +1923,7 @@ fn resolve_quit_guard(
     action: QuitGuardAction,
 ) -> Result<SchedulerSnapshot, String> {
     let outcome = {
-        let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+        let mut store = lock_store(&state.store);
         let outcome = apply_quit_guard_action(&mut store, action)?;
         if outcome.store_changed {
             state.persist_locked(&store)?;
@@ -1955,7 +1952,7 @@ fn update_settings(
     state: tauri::State<AppState>,
     updates: SettingsUpdate,
 ) -> Result<SchedulerSnapshot, String> {
-    let mut store = state.store.lock().expect("scheduler state mutex poisoned");
+    let mut store = lock_store(&state.store);
 
     if let Some(alerts) = updates.default_pre_alerts {
         store.settings.default_pre_alerts = normalize_alerts(&alerts);
@@ -1972,6 +1969,7 @@ fn update_settings(
     let final_warning_sec = store.settings.final_warning_sec;
     if let Some(active) = store.active.as_mut() {
         active.final_warning_duration_sec = final_warning_sec;
+        let _ = sync_shutdown_at_ms(active);
     }
 
     push_event(
@@ -2009,6 +2007,7 @@ pub fn run() {
                 state_path,
                 store: Mutex::new(store),
                 runtime: Mutex::new(RuntimeState::default()),
+                scanner: Arc::new(Mutex::new(ProcessScanner::new())),
             });
 
             setup_tray(app.handle())?;
@@ -2068,6 +2067,7 @@ mod tests {
             status: ScheduleStatus::FinalWarning,
             final_warning_started_at_ms: Some(1_000),
             final_warning_duration_sec: 60,
+            shutdown_at_ms: Some(61_000),
             shutdown_initiated_at_ms: None,
         }
     }
@@ -2093,6 +2093,77 @@ mod tests {
         assert!(!try_mark_shutdown_initiated(&mut schedule, 62_000));
         assert_eq!(schedule.status, ScheduleStatus::ShuttingDown);
         assert_eq!(schedule.shutdown_initiated_at_ms, Some(61_000));
+    }
+
+    #[test]
+    fn dry_run_shutdown_logs_abortable_command_plan() {
+        let settings = AppSettings {
+            default_pre_alerts: vec![600, 300, 60],
+            final_warning_sec: 60,
+            simulate_only: true,
+        };
+
+        let dispatch = run_shutdown_command(&settings)
+            .expect("simulate-only dry run should always return dispatch details");
+
+        assert!(dispatch.dry_run);
+        assert!(dispatch.log_line().contains("DRY_RUN_SHUTDOWN_COMMAND"));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(dispatch.command_line.contains("shutdown /s /t"));
+            assert!(dispatch
+                .command_line
+                .contains(&WINDOWS_ABORTABLE_SHUTDOWN_SEC.to_string()));
+            assert_eq!(dispatch.abort_hint.as_deref(), Some("shutdown /a"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(dispatch.command_line.contains("osascript"));
+            assert_eq!(dispatch.abort_hint, None);
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            assert!(dispatch.command_line.contains("unsupported"));
+            assert_eq!(dispatch.abort_hint, None);
+        }
+    }
+
+    #[test]
+    fn shutdown_at_ms_policy_for_armed_time_based_modes() {
+        let mut schedule = sample_final_warning_schedule();
+        schedule.status = ScheduleStatus::Armed;
+        schedule.mode = ScheduleMode::Countdown;
+        schedule.trigger_at_ms = Some(10_000);
+        schedule.final_warning_started_at_ms = None;
+        schedule.final_warning_duration_sec = 90;
+        schedule.shutdown_at_ms = None;
+
+        assert!(sync_shutdown_at_ms(&mut schedule));
+        assert_eq!(schedule.shutdown_at_ms, Some(100_000));
+    }
+
+    #[test]
+    fn shutdown_at_ms_policy_for_process_exit_armed_and_final_warning() {
+        let mut armed = sample_final_warning_schedule();
+        armed.mode = ScheduleMode::ProcessExit;
+        armed.status = ScheduleStatus::Armed;
+        armed.trigger_at_ms = None;
+        armed.final_warning_started_at_ms = None;
+        armed.shutdown_at_ms = Some(1);
+
+        assert!(sync_shutdown_at_ms(&mut armed));
+        assert_eq!(armed.shutdown_at_ms, None);
+
+        let mut warning = armed.clone();
+        warning.status = ScheduleStatus::FinalWarning;
+        warning.final_warning_started_at_ms = Some(50_000);
+        warning.final_warning_duration_sec = 60;
+
+        assert!(sync_shutdown_at_ms(&mut warning));
+        assert_eq!(warning.shutdown_at_ms, Some(110_000));
     }
 
     #[test]

@@ -19,7 +19,7 @@ export const ROUTE_LABEL_MAP: Record<string, string> = {
   "/history": "이력",
   "/settings/general": "일반 설정",
   "/settings/notifications": "알림 설정",
-  "/settings/integrations/google": "Google 연동",
+
   "/help": "도움말",
 };
 
@@ -30,7 +30,7 @@ export const NAV_LABEL_MAP: Record<string, string> = {
   "/history": "이력",
   "/settings/general": "일반 설정",
   "/settings/notifications": "알림 설정",
-  "/settings/integrations/google": "Google 연동",
+
   "/help": "도움말",
 };
 

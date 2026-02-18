@@ -26,10 +26,10 @@ async function armCountdownSchedule(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "새 예약 만들기" })).toBeVisible();
 
   await page.locator("#duration-minutes").fill("3");
-  await page.getByRole("button", { name: "예약 확인하기" }).click();
+  await page.getByRole("button", { name: "예약 준비" }).click();
 
-  await expect(page.getByRole("heading", { name: "예약 시작(Arm) 확인" })).toBeVisible();
-  await page.getByRole("button", { name: "예약 시작(Arm)" }).click();
+  await expect(page.getByRole("heading", { name: "예약을 활성화할까요?" })).toBeVisible();
+  await page.getByRole("button", { name: "예약 활성화" }).click();
 
   await expect(page.getByRole("heading", { name: "지금 할 수 있는 것" })).toBeVisible();
 }
@@ -51,7 +51,7 @@ test("Armed 상태에서 Cancel/Snooze가 키보드로 즉시 도달 가능", as
   await page.keyboard.press("Tab");
   await expect(page.locator("#quick-cancel-action")).toBeFocused();
   await page.keyboard.press("Tab");
-  await expect(page.locator("#quick-snooze-10-action")).toBeFocused();
+  await expect(page.locator("#quick-snooze-5-action")).toBeFocused();
   await expectNoCriticalA11yViolations(page);
 });
 
@@ -68,7 +68,8 @@ test("History 테이블 키보드 탐색 + 행 선택 + 상세 드로어 열기"
   await firstRow.focus();
   await page.keyboard.press("Enter");
 
-  await expect(page.locator(".ui-detail-drawer.is-open")).toBeVisible();
-  await expect(page.locator(".ui-detail-drawer.is-open .event-log-pre")).toBeVisible();
+  const detailDialog = page.getByRole("dialog", { name: "사용자 취소" });
+  await expect(detailDialog).toBeVisible();
+  await expect(detailDialog.getByRole("button", { name: "닫기" })).toBeVisible();
   await expectNoCriticalA11yViolations(page);
 });

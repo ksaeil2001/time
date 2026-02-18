@@ -1,3 +1,6 @@
+﻿> STATUS: ARCHIVED
+> Snapshot date: 2026-02-17
+> 원본 출처: C:\Users\ksaei\workspace\time\docs\archive\2026-02-17_pre-refactor\UI_REFACTOR_V2_SPEC.md
 # UI Refactor v2 Spec (STEP 1 Foundation)
 
 > Scope: Design System + AppShell v2 foundation only  
@@ -150,4 +153,5 @@
 - Final Grace 설정 범위(15~300초) 유지
 - 단일 활성 스케줄 정책 유지
 - OS 알림은 정보 표시(info-only) 정책 유지
+
 

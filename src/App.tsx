@@ -73,11 +73,11 @@ import "./App.css";
 import "./styles/design-system-v2.css";
 
 const ONBOARDING_KEY = "autosd.onboarding.completed.v1";
-const GOOGLE_CONNECTED_KEY = "autosd.google.connected.v1";
-const GOOGLE_STATUS_KEY = "autosd.google.status.v1";
+
 const PRE_ALERT_OPTION_MINUTES = [10, 5, 1] as const;
 const QUICK_SNOOZE_OPTION_MINUTES = [5, 10, 15] as const;
 const HISTORY_PAGE_SIZE = 120;
+const SOFT_COUNTDOWN_WINDOW_SEC = 10 * 60;
 
 type RoutePath =
   | "/onboarding/welcome"
@@ -89,7 +89,7 @@ type RoutePath =
   | "/history"
   | "/settings/general"
   | "/settings/notifications"
-  | "/settings/integrations/google"
+
   | "/help";
 
 const KNOWN_PATHS = new Set<RoutePath>(Object.keys(ROUTE_LABEL_MAP) as RoutePath[]);
@@ -101,7 +101,7 @@ const NAV_ICON_MAP: Record<string, IconName> = {
   "/history": "chevron",
   "/settings/general": "chevron",
   "/settings/notifications": "bell",
-  "/settings/integrations/google": "chevron",
+
   "/help": "chevron",
 };
 
@@ -115,7 +115,7 @@ const NAV_GROUP_MAP: Record<RoutePath, string> = {
   "/history": "기록",
   "/settings/general": "설정",
   "/settings/notifications": "설정",
-  "/settings/integrations/google": "설정",
+
   "/help": "도움말",
 };
 
@@ -129,7 +129,7 @@ const ROUTE_GUIDE_MAP: Record<RoutePath, string> = {
   "/history": "필터/검색/정렬로 빠르게 스캔하세요.",
   "/settings/general": "안전 모드와 저장 정책을 점검하세요.",
   "/settings/notifications": "알림 임계값과 미리보기를 확인하세요.",
-  "/settings/integrations/google": "옵션 연동 상태와 복구를 확인하세요.",
+
   "/help": "안전 고지와 FAQ를 확인하세요.",
 };
 
@@ -158,7 +158,7 @@ interface ConfirmDraft {
 
 type HistoryFilter = "all" | "success" | "failed" | "info";
 type HistorySort = "latest" | "oldest";
-type GoogleConnectionState = "disconnected" | "connected" | "token_expired";
+
 
 interface HistoryEventViewModel {
   id: string;
@@ -421,31 +421,78 @@ function inferEventChannel(item: ExecutionEvent): string {
   return "UI";
 }
 
+function isTimestampLikeToken(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    /\d{4}[.\-/]\s?\d{1,2}[.\-/]\s?\d{1,2}/.test(normalized) ||
+    /\d{1,2}:\d{2}(:\d{2})?/.test(normalized) ||
+    normalized.includes("오전") ||
+    normalized.includes("오후")
+  );
+}
+
+function sanitizeEventReason(item: ExecutionEvent): string {
+  const reason = item.reason?.trim();
+  if (!reason) {
+    return "";
+  }
+
+  const normalized = reason.replace(/\s+/g, " ");
+  const statusLabel = eventTypeLabel(item.eventType);
+
+  const segments = normalized
+    .split("·")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  const filtered = (segments.length > 1 ? segments : [normalized]).filter(
+    (segment) =>
+      segment !== statusLabel &&
+      segment !== "성공" &&
+      segment !== "실패" &&
+      segment !== "정보" &&
+      !isTimestampLikeToken(segment),
+  );
+
+  const unique = [...new Set(filtered)];
+  if (unique.length === 0) {
+    return "";
+  }
+
+  return unique[0];
+}
+
 function inferEventDescription(item: ExecutionEvent): string {
-  if (item.reason && item.reason.trim().length > 0) {
-    return item.reason.trim();
+  const sanitizedReason = sanitizeEventReason(item);
+  if (sanitizedReason) {
+    return sanitizedReason;
   }
 
   const fallback: Record<string, string> = {
-    armed: "예약이 활성화되어 종료 대기 상태가 되었습니다.",
-    cancelled: "사용자가 예약을 취소했습니다.",
-    postponed: "예약 종료 시점을 뒤로 미뤘습니다.",
-    alerted: "사전 알림이 전송되었습니다.",
-    final_warning: "최종 경고 단계에 진입했습니다.",
-    final_warning_reverted: "최종 경고 단계가 해제되었습니다.",
-    shutdown_initiated: "종료 명령이 실행 요청되었습니다.",
-    executed: "종료 동작이 정상 처리되었습니다.",
-    failed: "종료 처리 중 오류가 발생했습니다.",
-    settings_updated: "설정이 변경되었습니다.",
+    armed: "예약이 활성화됐어요.",
+    cancelled: "예약이 취소됐어요.",
+    postponed: "예약 시간이 미뤄졌어요.",
+    alerted: "사전 알림이 전송됐어요.",
+    final_warning: "최종 경고가 시작됐어요.",
+    final_warning_reverted: "최종 경고가 해제됐어요.",
+    shutdown_initiated: "종료 명령 실행을 시작했어요.",
+    executed: "예약이 정상 처리됐어요.",
+    failed: "예약 처리 중 오류가 발생했어요.",
+    settings_updated: "설정이 변경됐어요.",
   };
 
-  return fallback[item.eventType] ?? "상세 사유가 기록되지 않았습니다.";
+  return fallback[item.eventType] ?? "상세 사유가 기록되지 않았어요.";
 }
 
-function buildEventMetaChips(item: ExecutionEvent): string[] {
+function buildEventMetaChips(item: ExecutionEvent, nowMs: number): string[] {
   return [
     formatAbsoluteDateTime(item.timestampMs),
-    `채널: ${inferEventChannel(item)}`,
+    formatRelativePastFromMs(item.timestampMs, nowMs),
+    `출처: ${inferEventChannel(item)}`,
     `모드: ${inferEventMode(item)}`,
   ];
 }
@@ -467,7 +514,7 @@ function buildHistoryEventViewModel(item: ExecutionEvent, nowMs: number): Histor
     eventIcon: inferEventIcon(item),
     absoluteTime: formatAbsoluteDateTime(item.timestampMs),
     relativeTime: formatRelativePastFromMs(item.timestampMs, nowMs),
-    metaChips: buildEventMetaChips(item),
+    metaChips: buildEventMetaChips(item, nowMs),
     stateMachineStep: EVENT_STATE_MACHINE_MAP[item.eventType] ?? "Unknown",
     item,
   };
@@ -745,17 +792,12 @@ function FormRow({
 }
 function App() {
   const [route, navigate] = useHashRoute();
+  const routeSearchKey = route.search.toString();
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean>(() => {
     return window.localStorage.getItem(ONBOARDING_KEY) === "true";
   });
 
-  const [googleStatus, setGoogleStatus] = useState<GoogleConnectionState>(() => {
-    const saved = window.localStorage.getItem(GOOGLE_STATUS_KEY);
-    if (saved === "connected" || saved === "disconnected" || saved === "token_expired") {
-      return saved;
-    }
-    return window.localStorage.getItem(GOOGLE_CONNECTED_KEY) === "true" ? "connected" : "disconnected";
-  });
+
 
   const [snapshot, setSnapshot] = useState<SchedulerSnapshot | null>(null);
   const [statusError, setStatusError] = useState<string>("");
@@ -801,6 +843,9 @@ function App() {
   const [assertiveLiveMessage, setAssertiveLiveMessage] = useState<string>("");
 
   const hasLoadedSettingsRef = useRef<boolean>(false);
+  const snapshotRefreshInFlightRef = useRef<boolean>(false);
+  const processLoadInFlightRef = useRef<Promise<void> | null>(null);
+  const processAutoLoadEntryRef = useRef<string | null>(null);
   const liveRegionInitializedRef = useRef<boolean>(false);
   const previousActiveStatusRef = useRef<ScheduleStatus | "idle">("idle");
   const lastHistoryAnnouncementKeyRef = useRef<string>("");
@@ -808,12 +853,18 @@ function App() {
   const finalWarningCancelButtonRef = useRef<HTMLButtonElement | null>(null);
   const finalWarningRestoreFocusRef = useRef<HTMLElement | null>(null);
   const historyDetailRestoreFocusRef = useRef<HTMLElement | null>(null);
+  const alwaysOnTopPinnedRef = useRef<boolean>(false);
   const focusInput = (id: string) => {
     const node = document.getElementById(id) as HTMLInputElement | null;
     node?.focus();
   };
 
   const refreshSnapshot = useCallback(async () => {
+    if (snapshotRefreshInFlightRef.current) {
+      return;
+    }
+
+    snapshotRefreshInFlightRef.current = true;
     try {
       const next = await getSchedulerSnapshot();
       setSnapshot(next);
@@ -829,6 +880,8 @@ function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "상태를 불러오지 못했습니다.";
       setStatusError(message);
+    } finally {
+      snapshotRefreshInFlightRef.current = false;
     }
   }, []);
 
@@ -898,24 +951,40 @@ function App() {
   );
 
   const loadProcesses = useCallback(async () => {
-    setProcessLoading(true);
-    setProcessError("");
-
-    try {
-      const items = await listProcesses();
-      setProcesses(items);
-
-      if (selectedProcess) {
-        const matched = items.find((item) => item.pid === selectedProcess.pid);
-        setSelectedProcess(matched ?? null);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "프로세스 목록을 불러오지 못했습니다.";
-      setProcessError(message);
-    } finally {
-      setProcessLoading(false);
+    if (processLoadInFlightRef.current) {
+      await processLoadInFlightRef.current;
+      return;
     }
-  }, [selectedProcess]);
+
+    const pending = (async () => {
+      setProcessLoading(true);
+      setProcessError("");
+
+      try {
+        const items = await listProcesses();
+        setProcesses(items);
+        setSelectedProcess((previous) => {
+          if (!previous) {
+            return null;
+          }
+          const matched = items.find((item) => item.pid === previous.pid);
+          return matched ?? null;
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "프로세스 목록을 불러오지 못했습니다.";
+        setProcessError(message);
+      } finally {
+        setProcessLoading(false);
+      }
+    })();
+
+    processLoadInFlightRef.current = pending;
+    try {
+      await pending;
+    } finally {
+      processLoadInFlightRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     if (selectedProcess?.executable) {
@@ -924,10 +993,20 @@ function App() {
   }, [selectedProcess]);
 
   useEffect(() => {
-    if (route.path === "/schedule/new" && mode === "processExit" && !processLoading) {
-      void loadProcesses();
+    const shouldAutoLoad = route.path === "/schedule/new" && mode === "processExit";
+    if (!shouldAutoLoad) {
+      processAutoLoadEntryRef.current = null;
+      return;
     }
-  }, [loadProcesses, mode, processLoading, route.path]);
+
+    const entryKey = `${route.path}:${mode}:${routeSearchKey}`;
+    if (processAutoLoadEntryRef.current === entryKey) {
+      return;
+    }
+
+    processAutoLoadEntryRef.current = entryKey;
+    void loadProcesses();
+  }, [loadProcesses, mode, route.path, routeSearchKey]);
 
   useEffect(() => {
     const onOnline = () => setIsOffline(false);
@@ -940,10 +1019,7 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    window.localStorage.setItem(GOOGLE_STATUS_KEY, googleStatus);
-    window.localStorage.setItem(GOOGLE_CONNECTED_KEY, googleStatus === "connected" ? "true" : "false");
-  }, [googleStatus]);
+
 
   useEffect(() => {
     if (!showSettingsSavedToast) {
@@ -1112,26 +1188,57 @@ function App() {
 
   const active = snapshot?.active;
   const nowMs = snapshot?.nowMs ?? Date.now();
+  const shutdownAtMs = active?.shutdownAtMs;
+  const triggerReferenceMs = shutdownAtMs ?? active?.triggerAtMs;
 
   const remainingSeconds = useMemo(() => {
+    if (shutdownAtMs !== undefined) {
+      return Math.max(0, Math.floor((shutdownAtMs - nowMs) / 1000));
+    }
     if (!active?.triggerAtMs) {
       return null;
     }
     return Math.max(0, Math.floor((active.triggerAtMs - nowMs) / 1000));
-  }, [active?.triggerAtMs, nowMs]);
+  }, [active?.triggerAtMs, nowMs, shutdownAtMs]);
 
   const finalWarningRemainingSeconds = useMemo(() => {
-    if (active?.status !== "finalWarning" || active.finalWarningStartedAtMs === undefined) {
+    if (active?.status !== "finalWarning") {
+      return null;
+    }
+
+    if (shutdownAtMs !== undefined) {
+      return Math.max(0, Math.floor((shutdownAtMs - nowMs) / 1000));
+    }
+
+    if (active.finalWarningStartedAtMs === undefined) {
       return null;
     }
 
     const elapsed = Math.floor((nowMs - active.finalWarningStartedAtMs) / 1000);
     return Math.max(0, active.finalWarningDurationSec - elapsed);
-  }, [active, nowMs]);
+  }, [active, nowMs, shutdownAtMs]);
   const isFinalWarningDialogOpen =
     !quitGuard &&
     active?.status === "finalWarning" &&
     finalWarningRemainingSeconds !== null;
+
+  const softCountdownRemainingSeconds = useMemo(() => {
+    if (!active || remainingSeconds === null) {
+      return null;
+    }
+    if (remainingSeconds <= 0 || remainingSeconds > SOFT_COUNTDOWN_WINDOW_SEC) {
+      return null;
+    }
+    return remainingSeconds;
+  }, [active, remainingSeconds]);
+
+  const isSoftCountdownBannerVisible =
+    !quitGuard &&
+    !isFinalWarningDialogOpen &&
+    softCountdownRemainingSeconds !== null;
+
+  const shouldPinWindowAlwaysOnTop =
+    isFinalWarningDialogOpen || softCountdownRemainingSeconds !== null;
 
   const isWatchingProcess = active?.mode === "processExit" && active.status === "armed";
 
@@ -1151,11 +1258,11 @@ function App() {
   }, [active, nowMs]);
 
   const triggerAtLabel = useMemo(() => {
-    if (!active?.triggerAtMs) {
+    if (triggerReferenceMs === undefined) {
       return null;
     }
-    return formatAbsoluteAndRelative(active.triggerAtMs, nowMs);
-  }, [active?.triggerAtMs, nowMs]);
+    return formatAbsoluteAndRelative(triggerReferenceMs, nowMs);
+  }, [nowMs, triggerReferenceMs]);
 
   const schedulePreviewMs = useMemo(() => {
     if (mode === "countdown") {
@@ -1359,6 +1466,41 @@ function App() {
     };
   }, [isFinalWarningDialogOpen, quitGuard]);
 
+  useEffect(() => {
+    if (alwaysOnTopPinnedRef.current === shouldPinWindowAlwaysOnTop) {
+      return;
+    }
+
+    alwaysOnTopPinnedRef.current = shouldPinWindowAlwaysOnTop;
+    try {
+      void getCurrentWindow()
+        .setAlwaysOnTop(shouldPinWindowAlwaysOnTop)
+        .catch(() => {
+          // no-op (runtime may not support always-on-top)
+        });
+    } catch {
+      // no-op (non-tauri runtime)
+    }
+  }, [shouldPinWindowAlwaysOnTop]);
+
+  useEffect(() => {
+    return () => {
+      if (!alwaysOnTopPinnedRef.current) {
+        return;
+      }
+      alwaysOnTopPinnedRef.current = false;
+      try {
+        void getCurrentWindow()
+          .setAlwaysOnTop(false)
+          .catch(() => {
+            // no-op (runtime may not support always-on-top)
+          });
+      } catch {
+        // no-op (non-tauri runtime)
+      }
+    };
+  }, []);
+
   const filteredProcesses = useMemo(() => {
     const needle = processSearchQuery.trim().toLowerCase();
     if (!needle) {
@@ -1428,7 +1570,7 @@ function App() {
     return `사전 알림: ${preAlertLabel} · 최종 경고: ${finalWarningSecInput}초 · 최종 경고에서도 취소/미루기 가능`;
   }, [defaultAlertMinutes, finalWarningSecInput]);
 
-  const effectiveGoogleStatus: GoogleConnectionState | "offline" = isOffline ? "offline" : googleStatus;
+
 
   const resumePolicyBanner = useMemo(() => {
     if (!snapshot) {
@@ -1512,6 +1654,8 @@ function App() {
   const triggerAtDisplayLabel = active
     ? triggerAtLabel ?? (isWatchingProcess ? STATUS_TAG_COPY.watchingProcess : "-")
     : "-";
+  const shutdownAtDisplayLabel =
+    active && triggerReferenceMs !== undefined ? formatAbsoluteDateTime(triggerReferenceMs) : "-";
 
   const liveStatusText = active
     ? remainingSeconds !== null
@@ -1550,7 +1694,7 @@ function App() {
           finalWarningRemainingSeconds ?? active?.finalWarningDurationSec ?? FINAL_WARNING_SEC_DEFAULT,
         );
         setAssertiveLiveMessage(
-          `최종 경고 단계입니다. 종료 시각은 ${triggerAtDisplayLabel}이며 ${remainingLabel} 남았습니다. 지금 취소하거나 미룰 수 있습니다.`,
+          `최종 경고 단계입니다. 종료 시각은 ${shutdownAtDisplayLabel}이며 ${remainingLabel} 남았습니다. 지금 취소하거나 미룰 수 있습니다.`,
         );
       }
 
@@ -1580,6 +1724,7 @@ function App() {
     active?.status,
     finalWarningRemainingSeconds,
     snapshot,
+    shutdownAtDisplayLabel,
     triggerAtDisplayLabel,
   ]);
 
@@ -2148,10 +2293,10 @@ function App() {
                 items={dashboardRecentEvents.map((event) => ({
                   id: event.id,
                   icon: event.eventIcon,
-                  title: event.title,
-                  subtitle: event.description,
+                  title: event.description,
+                  subtitle: undefined,
                   resultTone: event.resultTone,
-                  resultLabel: event.resultLabel,
+                  resultLabel: event.title,
                   metaChips: event.metaChips,
                   selected: selectedHistoryEventId === event.id,
                   onSelect: () => openHistoryEventDetail(event.id),
@@ -2304,11 +2449,11 @@ function App() {
                     id: event.id,
                     event: (
                       <>
-                        <strong>{event.title}</strong>
-                        <span className="muted">{event.modeLabel}</span>
+                        <strong>{event.description}</strong>
+                        <span className="muted">{event.title}</span>
                       </>
                     ),
-                    reason: event.description,
+                    reason: `${event.channelLabel} · ${event.modeLabel}`,
                     resultTone: event.resultTone,
                     resultLabel: event.resultLabel,
                     absoluteTime: event.absoluteTime,
@@ -2446,67 +2591,7 @@ function App() {
       );
     }
 
-    if (route.path === "/settings/integrations/google") {
-      const statusCopy =
-        effectiveGoogleStatus === "connected"
-          ? { label: "연결됨", tone: "success" as const }
-          : effectiveGoogleStatus === "token_expired"
-            ? { label: "토큰 만료", tone: "warning" as const }
-            : effectiveGoogleStatus === "offline"
-              ? { label: "오프라인", tone: "warning" as const }
-              : { label: "연결 안 됨", tone: "info" as const };
 
-      return (
-        <Page>
-          <Stack gap="lg">
-            {renderStatusActionCard(false)}
-            <PageSection aria-labelledby="settings-google-title">
-              <PageHeader id="settings-google-title" title="Google 연동" description="이메일 알림은 종료 후가 아니라 종료 직전에 발송됩니다(옵션 기능)." />
-              <Card>
-                <CardHeader>
-                  <div>
-                    <CardTitle>연동 상태</CardTitle>
-                    <CardDescription>상태 배지와 복구 경로를 함께 제공합니다.</CardDescription>
-                  </div>
-                  <Badge kind="result" tone={statusCopy.tone}>{statusCopy.label}</Badge>
-                </CardHeader>
-                <CardActions>
-                  {googleStatus === "connected" ? (
-                    <AppButton variant="secondary" onClick={() => setGoogleStatus("disconnected")}>연결 해제</AppButton>
-                  ) : (
-                    <AppButton onClick={() => setGoogleStatus("connected")}>연결하기</AppButton>
-                  )}
-                  <AppButton
-                    variant="secondary"
-                    onClick={() => {
-                      if (effectiveGoogleStatus === "offline") {
-                        setActionError("오프라인 상태에서는 테스트 발송을 실행할 수 없습니다.");
-                        return;
-                      }
-                      if (effectiveGoogleStatus === "token_expired") {
-                        setActionError("토큰 만료 상태입니다. 다시 연결한 뒤 테스트해 주세요.");
-                        return;
-                      }
-                      setPoliteLiveMessage("테스트 발송을 실행했습니다. 실제 MVP에서는 모의 동작으로 기록됩니다.");
-                      setActionError("");
-                    }}
-                  >
-                    테스트 발송
-                  </AppButton>
-                  <AppButton variant="ghost" onClick={() => setGoogleStatus("token_expired")}>토큰 만료 시뮬레이션</AppButton>
-                </CardActions>
-                {effectiveGoogleStatus === "token_expired" || effectiveGoogleStatus === "offline" ? (
-                  <Inline>
-                    <AppButton variant="secondary" onClick={() => setGoogleStatus("connected")}>재시도</AppButton>
-                    <AppButton variant="secondary" onClick={() => void refreshSnapshot()}>설정 확인</AppButton>
-                  </Inline>
-                ) : null}
-              </Card>
-            </PageSection>
-          </Stack>
-        </Page>
-      );
-    }
 
     if (route.path === "/help") {
       return (
@@ -2596,8 +2681,8 @@ function App() {
 
   const renderEventDetail = (event: HistoryEventViewModel) => {
     const summaryText = [
-      `이벤트: ${event.title}`,
-      `사유: ${event.description}`,
+      `상태: ${event.title}`,
+      `요약: ${event.description}`,
       `시각: ${event.absoluteTime} (${event.relativeTime})`,
       `모드: ${event.modeLabel}`,
       `채널: ${event.channelLabel}`,
@@ -2609,8 +2694,8 @@ function App() {
         <Card>
           <CardHeader>
             <div>
-              <CardTitle>{event.title}</CardTitle>
-              <CardDescription>{event.description}</CardDescription>
+              <CardTitle>{event.description}</CardTitle>
+              <CardDescription>{event.title}</CardDescription>
             </div>
             <Badge kind="result" tone={event.resultTone}>{event.resultLabel}</Badge>
           </CardHeader>
@@ -2619,9 +2704,6 @@ function App() {
             <p><strong>모드</strong><span>{event.modeLabel}</span></p>
             <p><strong>채널</strong><span>{event.channelLabel}</span></p>
             <p><strong>상태 머신</strong><span>{event.stateMachineStep}</span></p>
-          </div>
-          <div className="ui-event-chip-row">
-            {event.metaChips.map((chip) => <span key={`${event.id}-${chip}`} className="ui-event-chip">{chip}</span>)}
           </div>
           <CardActions>
             <AppButton variant="secondary" size="sm" onClick={() => void handleCopy(summaryText)}>요약 복사</AppButton>
@@ -2789,6 +2871,37 @@ function App() {
         {assertiveLiveMessage}
       </div>
 
+      {isSoftCountdownBannerVisible ? (
+        <section className="soft-countdown-banner" role="status" aria-live="assertive" aria-atomic="true">
+          <div className="soft-countdown-copy">
+            <p className="soft-countdown-title">종료 대기 모드</p>
+            <p className="soft-countdown-message tabular">
+              종료 시각 {shutdownAtDisplayLabel} · 종료까지 {formatSeconds(softCountdownRemainingSeconds ?? 0)} 남았습니다.
+            </p>
+          </div>
+          <Inline className="soft-countdown-actions" justify="end" align="center">
+            <AppButton
+              variant="destructive"
+              immediate
+              className="safety-action"
+              onClick={() => void handleCancel()}
+              disabled={busy}
+            >
+              취소
+            </AppButton>
+            <AppButton
+              variant="secondary"
+              immediate
+              className="safety-action"
+              onClick={() => void handlePostpone(10)}
+              disabled={busy}
+            >
+              10분 미루기
+            </AppButton>
+          </Inline>
+        </section>
+      ) : null}
+
       <AppShellV2
         isOnboarding={isOnboarding}
         brandTitle={BRAND_COPY.title}
@@ -2828,7 +2941,7 @@ function App() {
               <Card>
                 <CardTitle>무엇이 일어나나요?</CardTitle>
                 <CardDescription>
-                  예약 시점이 되면 PC 종료 명령을 실행합니다.
+                  예약 시점이 되면 종료 대기 모드로 진입한 뒤 카운트다운이 0이 되는 순간에만 종료 명령을 전송합니다.
                   {snapshot?.settings.simulateOnly ? " (현재는 시뮬레이션 모드로 실제 종료는 실행되지 않음)" : ""}
                 </CardDescription>
               </Card>
@@ -2905,7 +3018,8 @@ function App() {
             <Stack gap="md">
               <h2 id="final-warning-title">{UI_COPY.finalWarningTitle}</h2>
               <p className="warning-count tabular" role="status" aria-live="assertive">
-                종료까지 {formatSeconds(finalWarningRemainingSeconds ?? active?.finalWarningDurationSec ?? FINAL_WARNING_SEC_DEFAULT)} 남았습니다.
+                종료 시각 {shutdownAtDisplayLabel} · 종료까지{" "}
+                {formatSeconds(finalWarningRemainingSeconds ?? active?.finalWarningDurationSec ?? FINAL_WARNING_SEC_DEFAULT)} 남았습니다.
               </p>
               <p id="final-warning-description" className="muted">지금 취소하거나 미루지 않으면 예약된 PC 종료가 진행됩니다.</p>
               <Inline justify="center">
